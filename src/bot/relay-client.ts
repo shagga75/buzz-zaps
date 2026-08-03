@@ -71,3 +71,37 @@ export async function publish(relay: Relay, event: Event, logger: Logger): Promi
   await relay.publish(event);
   logger.info({ id: event.id, kind: event.kind }, 'published event');
 }
+
+/**
+ * One-shot lookup for a single event by id — used when a reaction targets a
+ * message older than our in-memory author cache (e.g. posted before this
+ * process started).
+ */
+export function fetchEventById(relay: Relay, id: string, timeoutMs = 5_000): Promise<Event | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      sub.close();
+      resolve(null);
+    }, timeoutMs);
+
+    const sub = relay.subscribe([{ ids: [id] }], {
+      onevent(event) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        sub.close();
+        resolve(event);
+      },
+      oneose() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        sub.close();
+        resolve(null);
+      },
+    });
+  });
+}
