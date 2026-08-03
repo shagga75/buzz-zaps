@@ -41,3 +41,23 @@ export function parseLinkCommand(event: { content: string }): { lawalletUsername
   if (!match) return null;
   return { lawalletUsername: match[1] };
 }
+
+// `/bounty <pr-or-issue-event-id-hex> <amount>` — the id is a raw Nostr
+// event id (NIP-34 PRs have no human-friendly number), so it has to be
+// pasted in full.
+const BOUNTY_COMMAND_RE = /^\s*\/bounty\s+([0-9a-f]{64})\s+(\d+)\s*$/i;
+
+export interface BountyCommand {
+  targetEventId: string;
+  amountSats: number;
+}
+
+/** Parses a `/bounty <event-id> <amount>` command. */
+export function parseBountyCommand(event: { content: string }): BountyCommand | null {
+  const match = BOUNTY_COMMAND_RE.exec(event.content);
+  if (!match) return null;
+  const [, targetEventId, amountRaw] = match;
+  const amountSats = Number.parseInt(amountRaw, 10);
+  if (!Number.isFinite(amountSats) || amountSats <= 0) return null;
+  return { targetEventId: targetEventId.toLowerCase(), amountSats };
+}

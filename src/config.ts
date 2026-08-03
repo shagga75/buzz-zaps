@@ -13,6 +13,12 @@ const envSchema = z.object({
   TRIGGERS_CONFIG_PATH: z.string().default('./config/triggers.example.yaml'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   ZAP_RECEIPT_EXTRA_RELAYS: z.string().default(''),
+  // NIP-34 repo coordinate ("30617:<owner-hex>:<repo-d>", the `a`-tag value
+  // pointing at the repo's kind:30617 announcement) to scope bounty payouts
+  // to one repo. Unset watches every merged PR in the community — fine for
+  // a single-repo test setup, but a real multi-repo Buzz instance will want
+  // this set.
+  BUZZ_REPO_COORD: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -28,6 +34,7 @@ export interface AppConfig {
   logLevel: Env['LOG_LEVEL'];
   zapReceiptExtraRelays: string[];
   triggersConfigPath: string;
+  repoCoord: string | undefined;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -45,6 +52,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       .map((relay) => relay.trim())
       .filter(Boolean),
     triggersConfigPath: parsed.TRIGGERS_CONFIG_PATH,
+    repoCoord: parsed.BUZZ_REPO_COORD,
   };
 }
 
