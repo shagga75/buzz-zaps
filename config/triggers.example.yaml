@@ -1,0 +1,22 @@
+# buzz-zaps trigger config
+#
+# Fase 1 (implementada): el único trigger activo es el comando manual /zap,
+# escuchado directamente en src/bot/command-parser.ts — no pasa por este
+# archivo todavía. Se documenta acá para fijar la forma que va a tomar
+# cuando el trigger engine de Fase 2 lo lea en vez de tenerlo hardcodeado.
+#
+# Fase 2 (pendiente, ver spec sección 5.4): triggers automáticos como
+# reacción -> zap. `reaction_added` mapea 1:1 con el trigger `on: reaction_added`
+# que ya soporta el motor de workflows YAML nativo de Buzz
+# (crates/buzz-workflow/src/schema.rs) — evaluamos si conviene delegarle ese
+# trigger a Buzz vía /hooks/{id} en vez de reimplementarlo acá.
+
+community: buzz-zaps-test
+
+triggers:
+  - on: manual_zap_command
+    command: /zap
+
+  # - on: reaction_added
+  #   emoji: "🐝"
+  #   amount_sats: 21

@@ -1,0 +1,22 @@
+# Standalone compose file for the bridge service. buzz and lawallet-nwc each
+# run their own compose stacks (see their repos) — this deliberately doesn't
+# fold them in, matching the spec's "three independent stacks" setup.
+#
+# Since buzz-relay and lawallet-nwc/web are started separately on the host
+# (or in their own compose networks), reach them via host.docker.internal
+# rather than joining their networks. Point BUZZ_RELAY_URL / LAWALLET_BASE_URL
+# in your .env at host.docker.internal instead of localhost when running
+# buzz-zaps itself in Docker (see README).
+services:
+  buzz-zaps:
+    build: .
+    env_file:
+      - .env
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      - buzz-zaps-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  buzz-zaps-data:
