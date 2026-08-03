@@ -8,8 +8,11 @@ Buzz, LUD-16/LUD-21 contra LaWallet).
 Fase 1 (implementada): comando manual `/zap @usuario <monto>` en un canal → invoice → confirmación de
 pago → zap receipt (kind 9735) publicado de vuelta en el relay.
 
-Fase 2 (implementada): triggers automáticos por reacción. Reaccionar con un emoji configurado (🐝 por
-defecto) a un mensaje zapea al autor — mismo flujo de invoice/pago que Fase 1, solo cambia qué lo dispara.
+Fase 2 (implementada): dos triggers automáticos.
+- Reacción: reaccionar con un emoji configurado (🐝 por defecto) a un mensaje zapea a su autor.
+- Bounty: `/bounty <pr-id> <monto>` promete un pago que se libera solo cuando ese PR se mergea (NIP-34).
+
+Ambos reusan el mismo flujo de invoice/pago/receipt de Fase 1.
 
 ## Por qué está construido así (hallazgos antes de codear)
 
@@ -97,6 +100,42 @@ Guardas adicionales en `src/bot/reaction-flow.ts`:
   el mensaje es de antes de que `buzz-zaps` arrancara, hace un fallback de una sola consulta por id
   (`fetchEventById`) antes de rendirse.
 
+## Fase 2 — bounty por PR mergeado
+
+```
+/bounty <event-id-del-PR-o-issue> <monto-en-sats>
+```
+
+Promete un pago que se libera solo, sin intervención manual, cuando ese PR se mergea. "Escrow" acá es
+**soft**: no se mueve ni se retiene plata en ningún lado al registrar el bounty — es una promesa guardada
+en SQLite (`bounties`, `src/db/bounties.ts`). El pago sale recién al mergear, directo de la wallet ya
+conectada de la comunidad, mismo modelo no-custodial que el resto del bot. Una escrow real (fondos
+bloqueados por adelantado) habría significado custodiar plata de terceros — justo lo que la Fase 1 evitó
+a propósito.
+
+**Cómo se detecta el merge**: NIP-34 representa un PR mergeado como kind:1631 ("Applied/Merged"), con un
+tag `["e", "<id-del-PR>", "", "root"]` apuntando al PR (kind:1618, `crates/buzz-core/src/kind.rs` en el
+fork de Buzz). Dos cosas no obvias que se confirmaron leyendo el código antes de asumir nada:
+
+- **Este kind no está scopeado por canal.** `requires_h_channel_scope()` en `buzz-relay` no incluye los
+  kinds de git (1617–1633) — viven en el namespace del repo/comunidad, no bajo un tag `h`. Por eso hace
+  falta una suscripción separada sin filtro `#h` (`subscribeGlobal` en `src/bot/relay-client.ts`), en vez
+  de reusar la suscripción del canal. Opcionalmente se puede acotar a un solo repo con `BUZZ_REPO_COORD`
+  (`"30617:<owner-hex>:<repo-d>"`, el valor del tag `a`); sin configurar, escucha cualquier PR mergeado
+  en la comunidad.
+- **kind:1631 se reusa para "issue resuelto".** El mismo kind sirve para PRs mergeados e issues
+  resueltos — la única forma de distinguirlos es mirar el `kind` del evento raíz referenciado. `buzz-zaps`
+  lo busca (`fetchEventById`) y descarta silenciosamente cualquier 1631 cuyo root no sea kind:1618.
+
+**Quién cobra**: el autor del PR (el `pubkey` que firmó el kind:1618 original, no quien lo mergeó — esos
+pueden ser personas distintas), resuelto vía el mismo `/link` que usa el trigger de reacción. Sin link
+previo, el bounty queda pago-pendiente indefinidamente (no hay reintento automático — el evento de merge
+solo se emite una vez). Guarda de auto-pago: si quien registró el bounty es la misma persona que
+figura como autor del PR, se rechaza el pago.
+
+**Idempotencia**: como el evento de merge no se repite, un `hasSourceEvent()` nuevo en `ZapStore` evita
+reprocesar el mismo merge si el relay lo reenvía (ej. tras una reconexión).
+
 ## Setup local
 
 Asumiendo los tres repos como hermanos (ver spec sección 7):
@@ -168,16 +207,28 @@ eventos kind:9734/9735 — no reemplazan este flujo manual, que requiere las tre
 3. Mismo flujo que el paso 3-6 de arriba, pero disparado por la reacción en vez del comando — el log
    dice `detected reaction trigger` en vez de `detected /zap command`.
 
+### Fase 2: bounty por PR mergeado
+
+1. El autor del PR corre `/link su-username` (si no lo hizo ya).
+2. Alguien registra el bounty: `/bounty <event-id-del-PR> 5000` en el canal.
+3. Al mergear el PR (evento kind:1631 con `["e", "<event-id-del-PR>", "", "root"]`), `buzz-zaps` lo
+   detecta por la suscripción global (no la del canal — ver sección de arriba), resuelve el autor real
+   leyendo el PR original, y corre el mismo flujo de invoice/pago/receipt. El log dice
+   `detected merged bounty`.
+4. Si nadie registró un bounty para ese PR, o el autor no corrió `/link`, no pasa nada — silenciosamente,
+   sin publicar nada en el canal.
+
 ## Estructura
 
 ```
 src/
   bot/
-    relay-client.ts          # conectar + auth NIP-42 + suscribir/publicar/fetchEventById contra Buzz
-    command-parser.ts        # detectar "/zap @user <monto>" y "/link <username>"
-    zap-flow.ts               # runZapFlow compartido — invoice → reply → poll → receipt
+    relay-client.ts          # conectar + auth NIP-42 + suscribir(canal)/suscribir(global)/publicar/fetchEventById
+    command-parser.ts        # detectar "/zap @user <monto>", "/link <username>", "/bounty <id> <monto>"
+    zap-flow.ts               # runZapFlow compartido — invoice → reply → poll → receipt (devuelve el outcome)
     link-flow.ts               # handler de /link
     reaction-flow.ts            # handler de reacciones (Fase 2), matchea contra triggers.yaml
+    bounty-flow.ts               # handler de /bounty + payout al detectar kind:1631 (NIP-34, Fase 2)
     message-author-cache.ts     # cache eventId -> pubkey para resolver autores sin roundtrip
   lightning/
     lawallet-client.ts  # LUD-16 (invoice) + LUD-21 (verify/polling) contra LaWallet
@@ -186,11 +237,12 @@ src/
     messages.ts           # respuestas de canal (kind 9)
     zap-receipt.ts        # construcción kind:9734 / kind:9735
   db/
-    store.ts              # SQLite — auditoría de zaps (pending/paid/expired/failed)
+    store.ts              # SQLite — auditoría de zaps (pending/paid/expired/failed) + hasSourceEvent (idempotencia)
     links.ts               # SQLite — pubkey -> username de LaWallet (self-registrado con /link)
+    bounties.ts             # SQLite — bounties abiertos/pagados por PR (soft escrow, ver /bounty)
   config.ts               # env + config/triggers.example.yaml
 config/
-  triggers.example.yaml   # triggers activos: manual_zap_command (documental) + reaction_added (Fase 2, en uso)
+  triggers.example.yaml   # triggers activos: manual_zap_command (documental) + reaction_added (en uso)
 ```
 
 ## Próximos pasos (Fase 3, no implementados)
@@ -200,6 +252,11 @@ config/
   la extensión del listener propio que se implementó acá — quedó autocontenido a propósito para no
   depender de administrar workflows del lado de Buzz, pero delegarlo reusaría infraestructura que Buzz
   ya tiene battle-tested.
-- PR mergeado (NIP-34) → bounty desde escrow.
+- `/bounty` sin control de acceso: hoy cualquiera en el canal puede prometer sats de la wallet de la
+  comunidad. Producción necesita gatear esto a admins/owners del repo — Buzz ya tiene roles (NIP-43,
+  `role=admin`), falta conectar esa verificación acá.
+- Reintento de bounties fallidos: si el pago timeoutea o falla, el bounty queda `open` pero no hay
+  ningún evento que lo vuelva a disparar (el merge solo ocurre una vez). Falta un comando manual de
+  reintento o un job periódico.
 - Middleware de fee (1-2% por zap) y dashboard de administración por comunidad.
 - Wallets por comunidad (spec sección 5.5) en vez de una sola `LAWALLET_BASE_URL` fija.

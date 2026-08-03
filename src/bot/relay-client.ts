@@ -67,6 +67,33 @@ export function subscribeToChannel(
   return sub;
 }
 
+/**
+ * Subscribes without an `#h` channel filter — for kinds that aren't
+ * channel-scoped, like NIP-34 git status events (confirmed by reading
+ * `requires_h_channel_scope` in the buzz fork: git kinds 1617–1633 aren't
+ * in that list, so a PR merge notification never carries an `h` tag).
+ * Optionally scoped to one repo via its `a`-tag coordinate.
+ */
+export function subscribeGlobal(relay: Relay, kinds: number[], onEvent: (event: Event) => void, logger: Logger, repoCoord?: string) {
+  const filter: Filter = { kinds, ...(repoCoord ? { '#a': [repoCoord] } : {}) };
+  const sub = relay.subscribe([filter], {
+    onevent(event) {
+      if (!verifyEvent(event)) {
+        logger.warn({ id: event.id }, 'ignoring event with invalid signature');
+        return;
+      }
+      onEvent(event);
+    },
+    oneose() {
+      logger.info({ kinds, repoCoord }, 'global subscription caught up to end of stored events');
+    },
+    onclose(reason) {
+      logger.warn({ kinds, reason }, 'global subscription closed');
+    },
+  });
+  return sub;
+}
+
 export async function publish(relay: Relay, event: Event, logger: Logger): Promise<void> {
   await relay.publish(event);
   logger.info({ id: event.id, kind: event.kind }, 'published event');

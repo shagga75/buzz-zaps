@@ -78,6 +78,16 @@ export class ZapStore {
     this.db.prepare(`UPDATE zaps SET status = 'expired' WHERE id = @id`).run({ id });
   }
 
+  /**
+   * True if this event already started a zap flow. Used by triggers that
+   * can't rely on `insertPending`'s UNIQUE constraint alone — e.g. a merge
+   * status event should only ever pay out once, even if the relay
+   * redelivers it after a reconnect.
+   */
+  hasSourceEvent(sourceEventId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM zaps WHERE source_event_id = ?`).get(sourceEventId) !== undefined;
+  }
+
   close() {
     this.db.close();
   }

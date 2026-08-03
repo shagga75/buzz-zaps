@@ -37,7 +37,9 @@ export interface ZapRequest {
   comment?: string;
 }
 
-export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<void> {
+export type ZapOutcome = 'paid' | 'expired' | 'invoice_failed';
+
+export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<ZapOutcome> {
   const { relay, config, botSecretKey, lawallet, store, logger } = deps;
   const log = logger.child({ sourceEventId: req.sourceEventId, target: req.targetUsername, amountSats: req.amountSats });
 
@@ -51,7 +53,7 @@ export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<vo
     const message = err instanceof LaWalletError ? err.message : 'Unexpected error requesting the invoice.';
     log.error({ err }, 'invoice request failed');
     await reply(`⚠️ Couldn't create an invoice for @${req.targetUsername}: ${message}`);
-    return;
+    return 'invoice_failed';
   }
 
   const rowId = store.insertPending({
@@ -85,7 +87,7 @@ export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<vo
     store.markExpired(rowId);
     log.warn('payment did not settle before timeout');
     await reply(`⌛ The invoice for @${req.targetUsername} wasn't paid in time.`);
-    return;
+    return 'expired';
   }
 
   const receipt = buildZapReceipt(
@@ -105,6 +107,7 @@ export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<vo
   log.info({ receiptEventId: receipt.id }, 'zap receipt published');
 
   await reply(`✅ ${req.amountSats} sats zapped to @${req.targetUsername}! Receipt: ${receipt.id}`);
+  return 'paid';
 }
 
 /**
