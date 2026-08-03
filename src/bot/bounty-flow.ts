@@ -88,6 +88,10 @@ export async function handleMergeStatus(event: Event, deps: BountyFlowDeps): Pro
       channelId: config.channelId,
       sourceEventId: event.id,
       threadEventId: targetEventId,
+      // The PR is a NIP-34 event, not a channel message — it has no
+      // channel_id, so threading a reply under it gets rejected by the
+      // relay ("parent event has no channel association"). Post unthreaded.
+      channelReplyEventId: null,
       mentionPubkey: authorPubkey,
       requestedByPubkey: bounty.createdByPubkey,
       targetUsername,

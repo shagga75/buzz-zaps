@@ -71,6 +71,7 @@ export async function handleReaction(event: Event, deps: ReactionFlowDeps): Prom
       channelId: config.channelId,
       sourceEventId: event.id,
       threadEventId: targetEventId,
+      channelReplyEventId: targetEventId, // a channel message (kind 9/40002) — safe to thread against
       mentionPubkey: event.pubkey,
       requestedByPubkey: event.pubkey,
       targetUsername,

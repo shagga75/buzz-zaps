@@ -28,7 +28,15 @@ export interface ZapFlowDeps {
 export interface ZapRequest {
   channelId: string;
   sourceEventId: string;
+  /** What the zap request/receipt (kind 9734/9735) references as "zapped" — not channel-scope restricted. */
   threadEventId: string;
+  /**
+   * What the channel reply threads under, or null to post unthreaded. Must
+   * be a channel-scoped event (kind 9/40002) — pass null when threadEventId
+   * points at something outside the channel (e.g. a bounty's PR event), or
+   * the relay rejects the reply. See `ReplyTarget` in nostr/messages.ts.
+   */
+  channelReplyEventId: string | null;
   mentionPubkey: string;
   requestedByPubkey: string;
   targetUsername: string;
@@ -44,7 +52,7 @@ export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<Za
   const log = logger.child({ sourceEventId: req.sourceEventId, target: req.targetUsername, amountSats: req.amountSats });
 
   const reply = (content: string) =>
-    publish(relay, buildChannelReply(config.channelId, { threadEventId: req.threadEventId, mentionPubkey: req.mentionPubkey }, content, botSecretKey), logger);
+    publish(relay, buildChannelReply(config.channelId, { threadEventId: req.channelReplyEventId, mentionPubkey: req.mentionPubkey }, content, botSecretKey), logger);
 
   let invoice;
   try {
@@ -125,6 +133,7 @@ export async function handleChannelMessage(event: Event, deps: ZapFlowDeps): Pro
       channelId: deps.config.channelId,
       sourceEventId: event.id,
       threadEventId: event.id,
+      channelReplyEventId: event.id,
       mentionPubkey: event.pubkey,
       requestedByPubkey: event.pubkey,
       targetUsername: command.targetUsername,
