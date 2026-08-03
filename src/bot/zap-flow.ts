@@ -19,54 +19,60 @@ export interface ZapFlowDeps {
 }
 
 /**
- * Handles a single channel message: if it's a `/zap @user amount` command,
- * runs the full Fase 1 flow — request invoice, reply with it, poll for
- * settlement, publish the zap receipt (kind 9735). No-op for anything else.
+ * A zap to run, independent of what triggered it (manual /zap command,
+ * reaction, or any future Fase 2 trigger). `sourceEventId` is the DB
+ * dedup key; `threadEventId` is what replies and the zap receipt's `e` tag
+ * point at — usually the same event, but a reaction-triggered zap threads
+ * under the *reacted-to* message, not the reaction itself.
  */
-export async function handleChannelMessage(event: Event, deps: ZapFlowDeps): Promise<void> {
-  const { relay, config, botSecretKey, lawallet, store, logger } = deps;
-  const command = parseZapCommand(event);
-  if (!command) return;
+export interface ZapRequest {
+  channelId: string;
+  sourceEventId: string;
+  threadEventId: string;
+  mentionPubkey: string;
+  requestedByPubkey: string;
+  targetUsername: string;
+  targetPubkey: string;
+  amountSats: number;
+  comment?: string;
+}
 
-  const log = logger.child({ sourceEventId: event.id, target: command.targetUsername, amountSats: command.amountSats });
-  log.info('detected /zap command');
+export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<void> {
+  const { relay, config, botSecretKey, lawallet, store, logger } = deps;
+  const log = logger.child({ sourceEventId: req.sourceEventId, target: req.targetUsername, amountSats: req.amountSats });
+
+  const reply = (content: string) =>
+    publish(relay, buildChannelReply(config.channelId, { threadEventId: req.threadEventId, mentionPubkey: req.mentionPubkey }, content, botSecretKey), logger);
 
   let invoice;
   try {
-    invoice = await lawallet.requestInvoice(command.targetUsername, command.amountSats, `zap from Buzz channel ${config.channelId}`);
+    invoice = await lawallet.requestInvoice(req.targetUsername, req.amountSats, req.comment ?? `zap from Buzz channel ${config.channelId}`);
   } catch (err) {
     const message = err instanceof LaWalletError ? err.message : 'Unexpected error requesting the invoice.';
     log.error({ err }, 'invoice request failed');
-    const reply = buildChannelReply(config.channelId, event, `⚠️ Couldn't create an invoice for @${command.targetUsername}: ${message}`, botSecretKey);
-    await publish(relay, reply, logger);
+    await reply(`⚠️ Couldn't create an invoice for @${req.targetUsername}: ${message}`);
     return;
   }
 
   const rowId = store.insertPending({
     channelId: config.channelId,
-    sourceEventId: event.id,
-    requestedByPubkey: event.pubkey,
-    targetUsername: command.targetUsername,
-    targetPubkey: command.targetPubkey,
-    amountSats: command.amountSats,
+    sourceEventId: req.sourceEventId,
+    requestedByPubkey: req.requestedByPubkey,
+    targetUsername: req.targetUsername,
+    targetPubkey: req.targetPubkey,
+    amountSats: req.amountSats,
     bolt11: invoice.bolt11,
     verifyUrl: invoice.verifyUrl,
   });
 
-  const invoiceReply = buildChannelReply(
-    config.channelId,
-    event,
-    `⚡ Invoice for ${command.amountSats} sats to @${command.targetUsername}:\n\n${invoice.bolt11}`,
-    botSecretKey,
-  );
-  await publish(relay, invoiceReply, logger);
+  await reply(`⚡ Invoice for ${req.amountSats} sats to @${req.targetUsername}:\n\n${invoice.bolt11}`);
 
   const zapRequest = buildSyntheticZapRequest(
     {
-      recipientPubkey: command.targetPubkey,
-      zappedEventId: event.id,
+      recipientPubkey: req.targetPubkey,
+      zappedEventId: req.threadEventId,
       channelId: config.channelId,
-      amountMsats: command.amountSats * 1000,
+      amountMsats: req.amountSats * 1000,
       relays: [config.buzzRelayUrl, ...config.zapReceiptExtraRelays],
     },
     botSecretKey,
@@ -78,15 +84,14 @@ export async function handleChannelMessage(event: Event, deps: ZapFlowDeps): Pro
   if (!settlement.settled) {
     store.markExpired(rowId);
     log.warn('payment did not settle before timeout');
-    const reply = buildChannelReply(config.channelId, event, `⌛ The invoice for @${command.targetUsername} wasn't paid in time.`, botSecretKey);
-    await publish(relay, reply, logger);
+    await reply(`⌛ The invoice for @${req.targetUsername} wasn't paid in time.`);
     return;
   }
 
   const receipt = buildZapReceipt(
     {
-      recipientPubkey: command.targetPubkey,
-      zappedEventId: event.id,
+      recipientPubkey: req.targetPubkey,
+      zappedEventId: req.threadEventId,
       channelId: config.channelId,
       bolt11: invoice.bolt11,
       preimage: settlement.preimage,
@@ -99,11 +104,30 @@ export async function handleChannelMessage(event: Event, deps: ZapFlowDeps): Pro
   store.markPaid(rowId, receipt.id);
   log.info({ receiptEventId: receipt.id }, 'zap receipt published');
 
-  const confirmReply = buildChannelReply(
-    config.channelId,
-    event,
-    `✅ ${command.amountSats} sats zapped to @${command.targetUsername}! Receipt: ${receipt.id}`,
-    botSecretKey,
+  await reply(`✅ ${req.amountSats} sats zapped to @${req.targetUsername}! Receipt: ${receipt.id}`);
+}
+
+/**
+ * Handles a single channel message: if it's a `/zap @user amount` command,
+ * runs the full zap flow. No-op for anything else.
+ */
+export async function handleChannelMessage(event: Event, deps: ZapFlowDeps): Promise<void> {
+  const command = parseZapCommand(event);
+  if (!command) return;
+
+  deps.logger.info({ sourceEventId: event.id, target: command.targetUsername, amountSats: command.amountSats }, 'detected /zap command');
+
+  await runZapFlow(
+    {
+      channelId: deps.config.channelId,
+      sourceEventId: event.id,
+      threadEventId: event.id,
+      mentionPubkey: event.pubkey,
+      requestedByPubkey: event.pubkey,
+      targetUsername: command.targetUsername,
+      targetPubkey: command.targetPubkey,
+      amountSats: command.amountSats,
+    },
+    deps,
   );
-  await publish(relay, confirmReply, logger);
 }

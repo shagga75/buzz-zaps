@@ -30,3 +30,14 @@ export function parseZapCommand(event: { content: string; tags: string[][] }): Z
 
   return { targetUsername, amountSats, targetPubkey: pTag[1] };
 }
+
+// `/link username` — same charset LaWallet enforces when claiming a username
+// (lowercase letters and numbers, max 16 chars).
+const LINK_COMMAND_RE = /^\s*\/link\s+([a-z0-9]{1,16})\s*$/;
+
+/** Parses a `/link <lawallet-username>` self-registration command. */
+export function parseLinkCommand(event: { content: string }): { lawalletUsername: string } | null {
+  const match = LINK_COMMAND_RE.exec(event.content);
+  if (!match) return null;
+  return { lawalletUsername: match[1] };
+}

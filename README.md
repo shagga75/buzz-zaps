@@ -8,6 +8,9 @@ Buzz, LUD-16/LUD-21 contra LaWallet).
 Fase 1 (implementada): comando manual `/zap @usuario <monto>` en un canal → invoice → confirmación de
 pago → zap receipt (kind 9735) publicado de vuelta en el relay.
 
+Fase 2 (implementada): triggers automáticos por reacción. Reaccionar con un emoji configurado (🐝 por
+defecto) a un mensaje zapea al autor — mismo flujo de invoice/pago que Fase 1, solo cambia qué lo dispara.
+
 ## Por qué está construido así (hallazgos antes de codear)
 
 Antes de escribir código se clonaron y auditaron ambos forks. Resumen:
@@ -53,11 +56,46 @@ zap request por completo. Ver detalle exacto en `src/nostr/zap-receipt.ts`.
   (mencionado) como el username de LaWallet (LUD-16). Requiere que el mensaje tenga un tag `p` (mención)
   — si el cliente de Buzz no lo agrega automáticamente al escribir `@usuario`, el comando se ignora
   silenciosamente (se loguea un warning). No hay lookup de identidad cross-sistema en esta fase.
+- **`/link` es opt-in y por diseño**: los zaps por reacción (Fase 2) no arrancan hasta que el receptor
+  corre `/link` una vez — es fricción real, pero es la misma que confirmamos que LaWallet no resuelve
+  por nosotros (no expone lookup público pubkey→username). La alternativa (que `buzz-zaps` tenga una
+  credencial admin de LaWallet para resolverlo solo) cambia el modelo de confianza y no se implementó.
 - **Custodia del "zap issuer"**: como el bot firma el zap request en nombre del usuario que corrió el
   comando (no hay forma de que el bot posea la nsec de un tercero), el zap queda atribuido a la
   identidad del bot, no a la del que tipeó `/zap`. Aceptable para Fase 1 (comando manual, un canal de
   prueba); para Fase 2 (ej. reacción 🐝 → zap automático) esto es el mismo patrón que usan la mayoría
   de los zap-bots de Nostr hoy.
+
+## Fase 2 — reacción → zap
+
+El trigger `reaction_added` (`config/triggers.example.yaml`) zapea al autor de un mensaje cuando alguien
+reacciona con el emoji configurado. El problema que resuelve, y cómo:
+
+**Por qué hace falta `/link`**: una reacción (kind 7) solo trae el pubkey Nostr del autor del mensaje
+reaccionado, no su username de LaWallet. A diferencia del comando `/zap @usuario`, acá no hay un
+`@usuario` explícito para resolver. Se investigó si LaWallet expone un lookup público pubkey→username
+antes de diseñar esto — no lo tiene (el único endpoint que lista `pubkey` + `username` juntos,
+`GET /api/lightning-addresses`, exige permiso admin `ADDRESSES_READ`). Pedirle a `buzz-zaps` una
+credencial de admin de LaWallet para resolver esto automáticamente era una opción, pero implica más
+superficie de integración y resuelve identidades sin que el usuario lo pida explícitamente.
+
+En cambio, cada usuario corre una vez:
+
+```
+/link tu-username-de-lawallet
+```
+
+`buzz-zaps` guarda `pubkey → username` en su propia SQLite (`user_links`, ver `src/db/links.ts`). Es
+seguro porque el pubkey es el de quien *firmó* el evento `/link` — nadie puede linkear una identidad
+que no es la suya. Sin ese link previo, una reacción a tu mensaje no dispara nada (se loguea y se
+ignora en silencio, no se spamea el canal).
+
+Guardas adicionales en `src/bot/reaction-flow.ts`:
+- **Auto-zap**: reaccionar a tu propio mensaje no dispara nada.
+- **Cache de autores**: cada mensaje de canal que pasa por el listener se cachea en memoria
+  (`MessageAuthorCache`, tope 5000 entradas) para resolver el autor sin una consulta extra al relay. Si
+  el mensaje es de antes de que `buzz-zaps` arrancara, hace un fallback de una sola consulta por id
+  (`fetchEventById`) antes de rendirse.
 
 ## Setup local
 
@@ -118,14 +156,29 @@ Ver `.env.example` para la lista completa y sus defaults. Las que hay que setear
 Los tests unitarios (`pnpm test`) cubren el parser del comando y la construcción/consistencia de los
 eventos kind:9734/9735 — no reemplazan este flujo manual, que requiere las tres piezas vivas.
 
+### Fase 2: reacción → zap
+
+1. El usuario que va a recibir zaps corre `/link su-username` una vez en el canal.
+2. Cualquiera reacciona con 🐝 (o el emoji configurado en `config/triggers.example.yaml`) a un mensaje
+   de ese usuario:
+   ```bash
+   nak event -k 7 -c "🐝" --tag "h=<BUZZ_CHANNEL_ID>" --tag "e=<id-del-mensaje>" \
+     --auth --sec <tu-privkey> ws://localhost:3000
+   ```
+3. Mismo flujo que el paso 3-6 de arriba, pero disparado por la reacción en vez del comando — el log
+   dice `detected reaction trigger` en vez de `detected /zap command`.
+
 ## Estructura
 
 ```
 src/
   bot/
-    relay-client.ts     # conectar + auth NIP-42 + suscribir/publicar contra Buzz
-    command-parser.ts   # detectar "/zap @user <monto>"
-    zap-flow.ts          # orquesta el flujo completo Fase 1
+    relay-client.ts          # conectar + auth NIP-42 + suscribir/publicar/fetchEventById contra Buzz
+    command-parser.ts        # detectar "/zap @user <monto>" y "/link <username>"
+    zap-flow.ts               # runZapFlow compartido — invoice → reply → poll → receipt
+    link-flow.ts               # handler de /link
+    reaction-flow.ts            # handler de reacciones (Fase 2), matchea contra triggers.yaml
+    message-author-cache.ts     # cache eventId -> pubkey para resolver autores sin roundtrip
   lightning/
     lawallet-client.ts  # LUD-16 (invoice) + LUD-21 (verify/polling) contra LaWallet
   nostr/
@@ -134,16 +187,19 @@ src/
     zap-receipt.ts        # construcción kind:9734 / kind:9735
   db/
     store.ts              # SQLite — auditoría de zaps (pending/paid/expired/failed)
-  config.ts               # env + config/triggers.example.yaml (Fase 2)
+    links.ts               # SQLite — pubkey -> username de LaWallet (self-registrado con /link)
+  config.ts               # env + config/triggers.example.yaml
 config/
-  triggers.example.yaml   # documenta triggers automáticos (Fase 2, no activo aún)
+  triggers.example.yaml   # triggers activos: manual_zap_command (documental) + reaction_added (Fase 2, en uso)
 ```
 
-## Próximos pasos (Fase 2, no implementados)
+## Próximos pasos (Fase 3, no implementados)
 
-- Trigger engine leyendo `config/*.yaml` en vez de tener el comando `/zap` hardcodeado.
-- Reacción 🐝 → zap automático.
-- Evaluar si conviene delegarle triggers a los workflows YAML nativos de Buzz
-  (`crates/buzz-workflow`, acción `call_webhook`) en vez de reimplementar el trigger engine acá —
-  Buzz ya soporta `on: reaction_added` + `call_webhook` hacia `/hooks/{id}` de este servicio.
+- Evaluar si migrar el trigger de reacción a los workflows YAML nativos de Buzz
+  (`crates/buzz-workflow`, `on: reaction_added` + acción `call_webhook` hacia `/hooks/{id}`) en vez de
+  la extensión del listener propio que se implementó acá — quedó autocontenido a propósito para no
+  depender de administrar workflows del lado de Buzz, pero delegarlo reusaría infraestructura que Buzz
+  ya tiene battle-tested.
+- PR mergeado (NIP-34) → bounty desde escrow.
+- Middleware de fee (1-2% por zap) y dashboard de administración por comunidad.
 - Wallets por comunidad (spec sección 5.5) en vez de una sola `LAWALLET_BASE_URL` fija.
