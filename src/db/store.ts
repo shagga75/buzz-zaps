@@ -88,6 +88,21 @@ export class ZapStore {
     return this.db.prepare(`SELECT 1 FROM zaps WHERE source_event_id = ?`).get(sourceEventId) !== undefined;
   }
 
+  /**
+   * Counts by status, for the admin report (scripts/admin-report.ts). Note
+   * an `invoice_failed` outcome (runZapFlow returning before `insertPending`
+   * ever runs — see zap-flow.ts) never gets a row here at all, so it can't
+   * be counted; it only ever shows up in logs. `failed` stays 0 today since
+   * nothing calls `markFailed` — kept for schema forward-compatibility, not
+   * dead weight to remove.
+   */
+  summarizeStatus(): Record<ZapStatus, number> {
+    const rows = this.db.prepare(`SELECT status, COUNT(*) as count FROM zaps GROUP BY status`).all() as { status: ZapStatus; count: number }[];
+    const summary: Record<ZapStatus, number> = { pending: 0, paid: 0, expired: 0, failed: 0 };
+    for (const row of rows) summary[row.status] = row.count;
+    return summary;
+  }
+
   close() {
     this.db.close();
   }

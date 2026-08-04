@@ -25,6 +25,11 @@ Fee middleware (Fase 3, implementada): cada comunidad puede cobrar un fee (`fee_
 cada zap que paga a un tercero — un segundo invoice independiente a la wallet propia de `buzz-zaps`, no un
 descuento del pago principal (ver "Fase 3 — fee middleware" para el porqué).
 
+Dashboard de administración (Fase 3, implementada): `pnpm admin-report` — reporte de solo lectura por
+comunidad (triggers, fee, zaps por estado, bounties, links registrados), corrido local contra las SQLite
+y `communities.yaml` — sin puerto HTTP ni modelo de auth nuevo (ver "Fase 3 — dashboard de administración"
+para el porqué).
+
 ## Por qué está construido así (hallazgos antes de codear)
 
 Antes de escribir código se clonaron y auditaron ambos forks. Resumen:
@@ -269,6 +274,30 @@ Guardas en `chargeFeeIfConfigured` (`src/bot/zap-flow.ts`):
   warning y el flujo principal sigue intacto — un fee roto nunca debe tumbar el zap que el usuario
   realmente pidió.
 
+## Fase 3 — dashboard de administración
+
+```bash
+pnpm admin-report                        # todas las comunidades
+pnpm admin-report -- --community <name>  # una sola
+```
+
+Reporte de solo lectura por comunidad: triggers activos, fee configurada, conteo de zaps por estado,
+bounties abiertos/pagados (con sats totales), y cantidad de `/link` registrados. Lee directo las SQLite de
+cada comunidad y `communities.yaml` — no escribe nada.
+
+**Por qué CLI y no una UI web**: "dashboard" tiene lecturas muy distintas en riesgo — antes de codear se
+decidió explícitamente no exponer un puerto HTTP nuevo. `buzz-zaps` hoy no tiene ninguna superficie de
+entrada además del bot saliente (WebSocket hacia Buzz, HTTP hacia LaWallet); un servidor HTTP nuevo
+implica resolver auth desde cero (¿shared secret? ¿solo localhost?) para un proyecto que hoy corre una
+sola comunidad de prueba. Un reporte de solo lectura contra el filesystem local tiene el mismo nivel de
+riesgo que ya existe (acceso al server) — cero superficie nueva. Para cambiar algo seguís editando
+`communities.yaml` y reiniciando, como antes; esto es visibilidad, no un panel de control.
+
+**Gap conocido**: los conteos de zaps salen de la tabla `zaps`, pero un fallo al *pedir* el invoice
+(`invoice_failed`) nunca llega a insertar una fila ahí — `insertPending` solo corre después de que el
+pedido tuvo éxito. Ese fallo hoy solo queda en los logs. El reporte lo dice explícitamente en vez de
+mostrar un número que parezca completo y no lo sea.
+
 ## Setup local
 
 Asumiendo los tres repos como hermanos (ver spec sección 7):
@@ -410,6 +439,9 @@ src/
   index.ts                 # arranca N comunidades en paralelo — ver "Fase 2 — wallets por comunidad"
 config/
   communities.example.yaml   # una entrada por comunidad: relay, canal, wallet LaWallet y triggers
+scripts/
+  admin-report.ts             # reporte de solo lectura por comunidad, ver "Fase 3 — dashboard de administración"
+  generate-key.ts              # genera un BUZZ_BOT_NSEC nuevo
 ```
 
 ## Próximos pasos
@@ -429,8 +461,9 @@ config/
 - Reintento de bounties fallidos: si el pago timeoutea o falla, el bounty queda `open` pero no hay
   ningún evento que lo vuelva a disparar (el merge solo ocurre una vez). Falta un comando manual de
   reintento o un job periódico.
-- Dashboard de administración por comunidad (ver montos de fee cobrados, triggers activos, etc. — hoy solo
-  se puede inspeccionar editando `communities.yaml` y leyendo logs).
+- `pnpm admin-report` es de solo lectura y local (correr en la misma máquina/acceso al filesystem). Si
+  algún día hace falta consultarlo remoto (ej. un dashboard real para un operador que no tiene shell en el
+  server), ahí sí hace falta resolver el fork de auth/HTTP que se evitó a propósito acá.
 - El fee (Fase 3) es honor-system: nada obliga a pagar el segundo invoice, ni se trackea si se pagó o no.
   Para hacerlo real habría que, como mínimo, pollear también el invoice de fee y loguear/alertar cuando no
   se paga — no bloquear el zap principal por eso, pero sí tener visibilidad.

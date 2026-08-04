@@ -43,6 +43,12 @@ export class LinkStore {
     return row?.username ?? null;
   }
 
+  /** For the admin report (scripts/admin-report.ts). */
+  count(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as count FROM user_links`).get() as { count: number };
+    return row.count;
+  }
+
   close() {
     this.db.close();
   }
