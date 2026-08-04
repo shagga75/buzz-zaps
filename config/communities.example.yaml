@@ -1,4 +1,13 @@
-# buzz-zaps trigger config
+# buzz-zaps community config
+#
+# One process, N communities. A Buzz "community" is resolved server-side
+# from the connection's Host header (TenantContext in
+# crates/buzz-core/src/tenant.rs, confirmed reading it before designing this
+# — it's a deliberate multi-tenant fence, not something a client picks). So
+# each entry below opens its own relay connection and can point at its own
+# LaWallet instance: `relay_url` and `lawallet_base_url` are per-community,
+# never global env vars. BUZZ_BOT_NSEC (in .env) is the one thing shared —
+# the same bot identity authenticates against every community's relay.
 #
 # Fase 1 (implementada): el comando manual /zap está hardcodeado en
 # src/bot/command-parser.ts — no lee `triggers` acá abajo. Se documenta
@@ -27,16 +36,26 @@
 # invoking human's) — see README "Fase 2 — cobro automático" for why this is
 # a charge *request*, not an auto-debit.
 
-community: buzz-zaps-test
+communities:
+  - name: buzz-zaps-test
+    relay_url: ws://localhost:3000
+    channel_id: bd05a9e5-a869-450a-9e22-5b5705c6a714
+    lawallet_base_url: http://localhost:2288
 
-triggers:
-  - on: manual_zap_command
-    command: /zap
+    triggers:
+      - on: manual_zap_command
+        command: /zap
 
-  - on: reaction_added
-    emoji: "🐝"
-    amount_sats: 21
+      - on: reaction_added
+        emoji: "🐝"
+        amount_sats: 21
 
-  - on: agent_task_completed
-    amount_sats: 50
-    service_username: buzz-zaps-service
+      - on: agent_task_completed
+        amount_sats: 50
+        service_username: buzz-zaps-service
+
+  # Add a second (third, ...) entry here to serve another community from
+  # this same process — each gets its own relay connection, LaWallet
+  # instance, triggers, and SQLite file, with no state shared between them
+  # except the bot's Nostr identity (BUZZ_BOT_NSEC). See README "Fase 2 —
+  # wallets por comunidad" for a worked example and how it was live-tested.
