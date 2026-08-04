@@ -12,7 +12,8 @@
     "start": "node --env-file=.env dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "admin-report": "tsx --env-file=.env scripts/admin-report.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.9.1",

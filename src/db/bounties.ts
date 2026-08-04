@@ -60,6 +60,21 @@ export class BountyStore {
       .run(targetEventId);
   }
 
+  /** Count and total sats, by status — for the admin report (scripts/admin-report.ts). */
+  summarize(): Record<BountyStatus, { count: number; totalSats: number }> {
+    const rows = this.db.prepare(`SELECT status, COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total FROM bounties GROUP BY status`).all() as {
+      status: BountyStatus;
+      count: number;
+      total: number;
+    }[];
+    const summary: Record<BountyStatus, { count: number; totalSats: number }> = {
+      open: { count: 0, totalSats: 0 },
+      paid: { count: 0, totalSats: 0 },
+    };
+    for (const row of rows) summary[row.status] = { count: row.count, totalSats: row.total };
+    return summary;
+  }
+
   close() {
     this.db.close();
   }
