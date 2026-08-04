@@ -14,6 +14,18 @@
 # (`on: reaction_added` + acción `call_webhook`, crates/buzz-workflow/src/schema.rs)
 # en vez de escucharlo acá — por ahora se implementó como extensión del
 # mismo listener que ya usa Fase 1, así queda autocontenido en este repo.
+#
+# `agent_task_completed` (implementada): buzz's own kind:46001-46012
+# workflow-lifecycle events and kind:43001-43006 agent-job-protocol events
+# are reserved in crates/buzz-core/src/kind.rs but nothing in buzz-relay
+# actually publishes them yet (confirmed reading command_executor.rs and
+# buzz-workflow's executor.rs — only KIND_WORKFLOW_DEF/TRIGGER are handled).
+# So there's no real "task completed" Nostr event to listen for today. This
+# trigger instead fires on the one thing that IS real: an agent (any pubkey
+# with a kind:10100 AGENT_PROFILE) posting a NIP-10 reply to a human's
+# message. `service_username` is buzz-zaps' own LaWallet address (not the
+# invoking human's) — see README "Fase 2 — cobro automático" for why this is
+# a charge *request*, not an auto-debit.
 
 community: buzz-zaps-test
 
@@ -24,3 +36,7 @@ triggers:
   - on: reaction_added
     emoji: "🐝"
     amount_sats: 21
+
+  - on: agent_task_completed
+    amount_sats: 50
+    service_username: buzz-zaps-service

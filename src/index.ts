@@ -6,7 +6,9 @@ import { handleChannelMessage } from './bot/zap-flow.js';
 import { handleLinkCommand } from './bot/link-flow.js';
 import { handleReaction } from './bot/reaction-flow.js';
 import { handleBountyCommand, handleMergeStatus, KIND_GIT_STATUS_MERGED } from './bot/bounty-flow.js';
+import { handleAgentReply } from './bot/task-completion-flow.js';
 import { MessageAuthorCache } from './bot/message-author-cache.js';
+import { AgentPubkeyCache } from './bot/agent-cache.js';
 import { LaWalletClient } from './lightning/lawallet-client.js';
 import { ZapStore } from './db/store.js';
 import { LinkStore } from './db/links.js';
@@ -33,6 +35,7 @@ async function main() {
   const lawallet = new LaWalletClient(config.lawalletBaseUrl, logger);
   const relay = await connectAndAuthenticate(config.buzzRelayUrl, bot.secretKey, logger);
   const authorCache = new MessageAuthorCache();
+  const agentCache = new AgentPubkeyCache();
 
   // Channel-scoped: the manual /zap, /link, /bounty commands and reaction triggers.
   subscribeToChannel(
@@ -50,6 +53,20 @@ async function main() {
         });
         void handleBountyCommand(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, bounties, logger }).catch((err) => {
           logger.error({ err, eventId: event.id }, 'unhandled error processing /bounty command');
+        });
+        void handleAgentReply(event, {
+          relay,
+          config,
+          botPubkey: bot.pubkey,
+          botSecretKey: bot.secretKey,
+          lawallet,
+          store,
+          logger,
+          authorCache,
+          agentCache,
+          triggers,
+        }).catch((err) => {
+          logger.error({ err, eventId: event.id }, 'unhandled error processing agent task completion');
         });
         return;
       }

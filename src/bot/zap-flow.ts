@@ -37,6 +37,8 @@ export interface ZapRequest {
    * the relay rejects the reply. See `ReplyTarget` in nostr/messages.ts.
    */
   channelReplyEventId: string | null;
+  /** NIP-10 root, only if `channelReplyEventId` is itself a reply (not the thread root) — see `ReplyTarget.rootEventId`. */
+  channelReplyRootEventId?: string;
   mentionPubkey: string;
   requestedByPubkey: string;
   targetUsername: string;
@@ -52,7 +54,16 @@ export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<Za
   const log = logger.child({ sourceEventId: req.sourceEventId, target: req.targetUsername, amountSats: req.amountSats });
 
   const reply = (content: string) =>
-    publish(relay, buildChannelReply(config.channelId, { threadEventId: req.channelReplyEventId, mentionPubkey: req.mentionPubkey }, content, botSecretKey), logger);
+    publish(
+      relay,
+      buildChannelReply(
+        config.channelId,
+        { threadEventId: req.channelReplyEventId, rootEventId: req.channelReplyRootEventId, mentionPubkey: req.mentionPubkey },
+        content,
+        botSecretKey,
+      ),
+      logger,
+    );
 
   let invoice;
   try {

@@ -8,11 +8,13 @@ Buzz, LUD-16/LUD-21 contra LaWallet).
 Fase 1 (implementada): comando manual `/zap @usuario <monto>` en un canal → invoice → confirmación de
 pago → zap receipt (kind 9735) publicado de vuelta en el relay.
 
-Fase 2 (implementada): dos triggers automáticos.
+Fase 2 (implementada): tres triggers automáticos.
 - Reacción: reaccionar con un emoji configurado (🐝 por defecto) a un mensaje zapea a su autor.
 - Bounty: `/bounty <pr-id> <monto>` promete un pago que se libera solo cuando ese PR se mergea (NIP-34).
+- Cobro por tarea completada: un agente respondiendo (NIP-10) a un mensaje de un humano le cobra
+  `amount_sats` a ese humano.
 
-Ambos reusan el mismo flujo de invoice/pago/receipt de Fase 1.
+Los tres reusan el mismo flujo de invoice/pago/receipt de Fase 1.
 
 ## Por qué está construido así (hallazgos antes de codear)
 
@@ -136,6 +138,54 @@ figura como autor del PR, se rechaza el pago.
 **Idempotencia**: como el evento de merge no se repite, un `hasSourceEvent()` nuevo en `ZapStore` evita
 reprocesar el mismo merge si el relay lo reenvía (ej. tras una reconexión).
 
+## Fase 2 — cobro automático por tarea completada
+
+`agent_task_completed` (`config/triggers.example.yaml`) cobra `amount_sats` a un usuario cuando un
+agente responde a su mensaje en el canal.
+
+**Por qué no escucha un evento "task completed" formal**: el spec original pedía enganchar esto a "un
+evento de workflow" de Buzz. Antes de diseñar nada se leyó el código real:
+
+- `crates/buzz-core/src/kind.rs` reserva `kind:43001-43006` (protocolo de "agent job": request, accepted,
+  progress, **result**, cancel, error) y `kind:46001-46012` (ciclo de vida de workflows: triggered, step
+  completed, **workflow completed**, failed, cancelled, approvals). Son justo los candidatos obvios.
+- Pero **nada los publica hoy**. `crates/buzz-relay/src/handlers/command_executor.rs` solo maneja
+  `KIND_WORKFLOW_DEF` (definir un workflow) y `KIND_WORKFLOW_TRIGGER` (dispararlo) — ningún handler emite
+  `KIND_WORKFLOW_COMPLETED` de vuelta al relay. El protocolo de agent job (43001-43006) ni siquiera tiene
+  un handler: solo aparece contado en queries de feed/actividad (`crates/buzz-db/src/feed.rs`).
+- Sí existe un evento real de "el agente hizo algo": `kind:44200` (`KIND_AGENT_TURN_METRIC`), publicado en
+  cada turno por `TurnCompletionGuard` en `crates/buzz-acp/src/pool.rs`. Pero está cifrado NIP-44 al dueño
+  del agente y el relay solo lo devuelve a ese dueño autenticado por NIP-42 (confirmado en la doc del
+  kind) — un bridge de terceros como `buzz-zaps` no puede verlo ni leerlo.
+
+Conclusión: hoy no hay ningún evento Nostr público y en vivo que signifique "tarea completada". Lo único
+real y observable es que el agente publica su respuesta como un mensaje de canal normal. Por eso el
+trigger se redefinió como: **un pubkey con perfil de agente (`kind:10100`, `KIND_AGENT_PROFILE`) responde
+en NIP-10 (`e` tag marcado `reply`) al mensaje de un humano** → se cobra al humano. Contribuir el evento
+formal río arriba (agregar el publish que falta en `buzz-relay`) queda anotado en "Próximos pasos" — es
+un cambio al core de Buzz, fuera del alcance de Fase 1-2.
+
+**"Cobrar" es pedir, no debitar automáticamente**: se investigó si LaWallet expone alguna forma de que un
+tercero autorizado retire fondos de la wallet de otro usuario, antes de asumir que "auto-charge" implica
+auto-débito. No la tiene — cada ruta de pago bajo `apps/web/app/api/remote-wallets` y
+`apps/web/app/api/wallet` está scopeada a la sesión autenticada del propio dueño (`loadOwnedWallet` en
+`remote-wallets/[id]/route.ts` devuelve 404, no 403, si la wallet no es del caller). Construir un
+auto-débito real habría exigido o (a) que el usuario le entregue a `buzz-zaps` su propia sesión/JWT —
+inaceptable, es takeover de cuenta — o (b) un endpoint nuevo en LaWallet para autorizar cobros de
+terceros, que es contribuir al fork con un cambio de superficie de confianza grande, no algo para decidir
+implícitamente. Se optó por reusar el mismo patrón "pedir invoice y esperar" de cada otro trigger: se
+genera un invoice a la dirección de LaWallet **del propio servicio** (`service_username` en el trigger,
+no resuelto vía `/link` — el que cobra es `buzz-zaps`, no un usuario), se publica en el canal
+mencionando al humano, y el pago sigue siendo un acto manual suyo.
+
+Guardas en `src/bot/task-completion-flow.ts`:
+- Solo dispara si el mensaje es una respuesta NIP-10 (`e` tag `reply`) — un agente hablando sin responder
+  a nadie no cobra.
+- Ignora si el que invocó es el propio agente, el bot, o (nueva consulta `kind:10100`) también tiene
+  perfil de agente — evita cobrar cadenas agente-a-agente.
+- Cache de agente (`AgentPubkeyCache`, mismo patrón que `MessageAuthorCache`) para no reconsultar
+  `kind:10100` en cada mensaje.
+
 ## Setup local
 
 Asumiendo los tres repos como hermanos (ver spec sección 7):
@@ -218,6 +268,19 @@ eventos kind:9734/9735 — no reemplazan este flujo manual, que requiere las tre
 4. Si nadie registró un bounty para ese PR, o el autor no corrió `/link`, no pasa nada — silenciosamente,
    sin publicar nada en el canal.
 
+### Fase 2: cobro por tarea completada
+
+1. Un pubkey con `kind:10100` (perfil de agente) responde a un mensaje de un humano en el canal:
+   ```bash
+   nak event -k 9 -c "listo, ya lo hice" \
+     --tag "h=<BUZZ_CHANNEL_ID>" --tag "e=<id-del-mensaje-del-humano>;;reply" --tag "p=<hex-pubkey-del-humano>" \
+     --auth --sec <nsec-del-agente> ws://localhost:3000
+   ```
+2. Mismo flujo de invoice/pago/receipt que los anteriores, pero el invoice es a `service_username` (la
+   wallet del propio `buzz-zaps`, no del humano) — el log dice `detected agent task completion`.
+3. Si el pubkey que respondió no tiene `kind:10100`, o el mensaje no es una respuesta NIP-10, o quien
+   invocó también es un agente, no pasa nada.
+
 ## Estructura
 
 ```
@@ -229,7 +292,9 @@ src/
     link-flow.ts               # handler de /link
     reaction-flow.ts            # handler de reacciones (Fase 2), matchea contra triggers.yaml
     bounty-flow.ts               # handler de /bounty + payout al detectar kind:1631 (NIP-34, Fase 2)
+    task-completion-flow.ts      # handler de reply-de-agente -> cobro al invocador (Fase 2)
     message-author-cache.ts     # cache eventId -> pubkey para resolver autores sin roundtrip
+    agent-cache.ts               # cache pubkey -> es-agente (kind:10100), evita requery por mensaje
   lightning/
     lawallet-client.ts  # LUD-16 (invoice) + LUD-21 (verify/polling) contra LaWallet
   nostr/
@@ -247,6 +312,10 @@ config/
 
 ## Próximos pasos (Fase 3, no implementados)
 
+- **Contribuir el evento formal de "task completed" río arriba a `buzz`**: hoy `agent_task_completed`
+  detecta un reply de agente como proxy porque `KIND_WORKFLOW_COMPLETED`/`KIND_JOB_RESULT` no se publican
+  (ver "Fase 2 — cobro automático"). El fix real es agregar ese publish en `buzz-relay` — cambia el core
+  que Fase 1-2 evitó tocar a propósito, así que quedó fuera de alcance por ahora.
 - Evaluar si migrar el trigger de reacción a los workflows YAML nativos de Buzz
   (`crates/buzz-workflow`, `on: reaction_added` + acción `call_webhook` hacia `/hooks/{id}`) en vez de
   la extensión del listener propio que se implementó acá — quedó autocontenido a propósito para no
