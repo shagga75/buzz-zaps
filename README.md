@@ -16,6 +16,11 @@ Fase 2 (implementada): tres triggers automáticos.
 
 Los tres reusan el mismo flujo de invoice/pago/receipt de Fase 1.
 
+Wallets por comunidad (implementada): un solo proceso de `buzz-zaps` sirve N comunidades de Buzz en
+simultáneo, cada una con su propia conexión al relay, su propia instancia de LaWallet y sus propios
+triggers — sin estado compartido entre ellas salvo la identidad Nostr del bot (`config/communities.yaml`,
+ver "Fase 2 — wallets por comunidad").
+
 ## Por qué está construido así (hallazgos antes de codear)
 
 Antes de escribir código se clonaron y auditaron ambos forks. Resumen:
@@ -73,7 +78,7 @@ zap request por completo. Ver detalle exacto en `src/nostr/zap-receipt.ts`.
 
 ## Fase 2 — reacción → zap
 
-El trigger `reaction_added` (`config/triggers.example.yaml`) zapea al autor de un mensaje cuando alguien
+El trigger `reaction_added` (`config/communities.example.yaml`) zapea al autor de un mensaje cuando alguien
 reacciona con el emoji configurado. El problema que resuelve, y cómo:
 
 **Por qué hace falta `/link`**: una reacción (kind 7) solo trae el pubkey Nostr del autor del mensaje
@@ -122,9 +127,9 @@ fork de Buzz). Dos cosas no obvias que se confirmaron leyendo el código antes d
 - **Este kind no está scopeado por canal.** `requires_h_channel_scope()` en `buzz-relay` no incluye los
   kinds de git (1617–1633) — viven en el namespace del repo/comunidad, no bajo un tag `h`. Por eso hace
   falta una suscripción separada sin filtro `#h` (`subscribeGlobal` en `src/bot/relay-client.ts`), en vez
-  de reusar la suscripción del canal. Opcionalmente se puede acotar a un solo repo con `BUZZ_REPO_COORD`
-  (`"30617:<owner-hex>:<repo-d>"`, el valor del tag `a`); sin configurar, escucha cualquier PR mergeado
-  en la comunidad.
+  de reusar la suscripción del canal. Opcionalmente se puede acotar a un solo repo con `repo_coord` en la
+  entrada de esa comunidad en `communities.yaml` (`"30617:<owner-hex>:<repo-d>"`, el valor del tag `a`);
+  sin configurar, escucha cualquier PR mergeado que esa comunidad pueda ver.
 - **kind:1631 se reusa para "issue resuelto".** El mismo kind sirve para PRs mergeados e issues
   resueltos — la única forma de distinguirlos es mirar el `kind` del evento raíz referenciado. `buzz-zaps`
   lo busca (`fetchEventById`) y descarta silenciosamente cualquier 1631 cuyo root no sea kind:1618.
@@ -140,7 +145,7 @@ reprocesar el mismo merge si el relay lo reenvía (ej. tras una reconexión).
 
 ## Fase 2 — cobro automático por tarea completada
 
-`agent_task_completed` (`config/triggers.example.yaml`) cobra `amount_sats` a un usuario cuando un
+`agent_task_completed` (`config/communities.example.yaml`) cobra `amount_sats` a un usuario cuando un
 agente responde a su mensaje en el canal.
 
 **Por qué no escucha un evento "task completed" formal**: el spec original pedía enganchar esto a "un
@@ -186,6 +191,48 @@ Guardas en `src/bot/task-completion-flow.ts`:
 - Cache de agente (`AgentPubkeyCache`, mismo patrón que `MessageAuthorCache`) para no reconsultar
   `kind:10100` en cada mensaje.
 
+## Fase 2 — wallets por comunidad
+
+Hasta acá, todo corría con una sola `LAWALLET_BASE_URL` fija en `.env` — un proceso, una comunidad de
+Buzz, una wallet. Este cambio hace que un solo proceso de `buzz-zaps` pueda servir **N comunidades en
+simultáneo**, cada una con su propia conexión al relay, su propia instancia de LaWallet, sus propios
+triggers y su propia base SQLite.
+
+**Por qué el alcance real de esto no es "elegir la wallet correcta dentro de una comunidad"**: antes de
+tocar código se leyó `crates/buzz-core/src/tenant.rs` en el fork de `buzz`. Una "community" en Buzz no es
+algo que el cliente elige — se resuelve **del lado del servidor, a partir del host de la conexión**
+(`TenantContext::resolved`, con un comentario explícito de que es una barrera de multi-tenencia
+deliberada: "a request's community is resolved from the connection host by the server, never supplied or
+influenced by the client"). Como antes `buzz-zaps` abría una sola conexión con un solo host, ya estaba
+atado a una sola comunidad de por sí — el gap real no era de ruteo de wallet, era que el proceso entero
+solo sabía hablar con una comunidad a la vez.
+
+**Cómo quedó armado**: `config/communities.yaml` reemplaza a `config/triggers.example.yaml` — ya no hay
+`BUZZ_CHANNEL_ID`/`LAWALLET_BASE_URL`/`TRIGGERS_CONFIG_PATH` en `.env` (ver "Variables de entorno"). Cada
+entrada de `communities:` es un `{ name, relay_url, channel_id, lawallet_base_url, triggers, ... }`
+independiente. `src/index.ts` arranca todas con `Promise.all`: cada una abre su propia conexión NIP-42 al
+relay, su propio `LaWalletClient`, sus propias `ZapStore`/`LinkStore`/`BountyStore` (SQLite en
+`${DB_DIR}/${name}.sqlite3` si no seteás `db_path`), y corre exactamente los mismos handlers que antes —
+nada compartido entre comunidades salvo la identidad Nostr del bot (`BUZZ_BOT_NSEC`), que sigue siendo una
+sola: nada impide autenticar la misma clave contra relays/hosts distintos.
+
+**Live-test real (no dos wallets de juguete, dos comunidades reales)**:
+1. Se insertó una segunda fila en la tabla `communities` de Buzz (`host = '127.0.0.2:3000'`) — mismo
+   proceso de relay ya corriendo en `0.0.0.0:3000`, sin reiniciarlo ni levantar un segundo. `127.0.0.2` es
+   loopback (no necesita DNS ni `/etc/hosts`: todo `127.0.0.0/8` rutea a `lo` en Linux), así que conectar
+   a `ws://127.0.0.2:3000` golpea el mismo puerto con un `Host` distinto.
+2. Se creó un canal `open` (kind:9007) autenticando contra `ws://127.0.0.2:3000` — confirmado en la DB que
+   quedó scopeado a la nueva comunidad, no a la de siempre.
+3. `communities.yaml` de prueba con dos entradas: `buzz-zaps-test` (la de siempre, `lawallet_base_url:
+   http://localhost:2288`, real) y una segunda con `relay_url: ws://127.0.0.2:3000` y
+   `lawallet_base_url: http://localhost:2299` — un puerto **a propósito** sin nada escuchando.
+4. `buzz-zaps` arrancó las dos en paralelo, cada log línea taggeado con `community: "<nombre>"`.
+5. Se disparó `/zap @buzzzaptarget 21` en el canal de cada comunidad. Resultado — cada una le pegó a su
+   propia URL, sin fugas cruzadas: la comunidad real terminó en el mismo `HTTP 503` conocido de la wallet
+   NWC gratuita (ver "Known limitations"); la comunidad de prueba terminó en `ECONNREFUSED
+   127.0.0.1:2299` — la prueba de que nunca cayó de vuelta a la wallet real de la otra comunidad.
+6. `ls data/` mostró `buzz-zaps-test.sqlite3` y `buzz-zaps-test-b.sqlite3` como archivos separados.
+
 ## Setup local
 
 Asumiendo los tres repos como hermanos (ver spec sección 7):
@@ -206,26 +253,44 @@ cd buzz-zaps
 pnpm install
 cp .env.example .env
 pnpm exec tsx scripts/generate-key.ts     # pegar el BUZZ_BOT_NSEC generado en .env
-# completar BUZZ_CHANNEL_ID (ver abajo) y LAWALLET_BASE_URL si cambiaste el puerto
+cp config/communities.example.yaml config/communities.yaml   # o editá el .example directo en dev
+# completar channel_id (ver abajo) y lawallet_base_url si cambiaste el puerto
 pnpm dev
 ```
 
 ### Variables de entorno (`.env`)
 
-Ver `.env.example` para la lista completa y sus defaults. Las que hay que setear a mano:
+Ver `.env.example` para la lista completa y sus defaults — son todas cosas compartidas por cada
+comunidad que este proceso sirve (identidad del bot, polling de LaWallet, dónde vive
+`communities.yaml`). Las que hay que setear a mano:
 
-- `BUZZ_BOT_NSEC` — identidad Nostr del bot (generar con `scripts/generate-key.ts`).
-- `BUZZ_CHANNEL_ID` — UUID del canal de prueba en Buzz. Se obtiene creándolo (kind 9007, `nak event -k
-  9007 --tag "name=zap-test" --auth --sec <tu-privkey> ws://localhost:3000`) o desde la app de
-  escritorio de Buzz (Settings del canal → copiar ID). El relay lo asigna al crear el grupo.
-- `LAWALLET_BASE_URL` — por defecto `http://localhost:2288` (puerto de `apps/web` en el compose de
-  lawallet-nwc). El usuario destino del `/zap` (`@usuario`) debe existir en esa instancia con una
-  Lightning Address activa (crearlo desde la UI de LaWallet o `pnpm seed` en ese repo).
+- `BUZZ_BOT_NSEC` — identidad Nostr del bot (generar con `scripts/generate-key.ts`). La misma identidad
+  autentica contra el relay de cada comunidad.
+
+### Comunidades (`config/communities.yaml`)
+
+Todo lo que **sí** varía por comunidad vive acá, no en `.env` — ver el porqué en "Fase 2 — wallets por
+comunidad". Cada entrada de `communities:` necesita:
+
+- `name` — etiqueta única (se usa para derivar el path de su SQLite si no seteás `db_path`).
+- `relay_url` — URL del relay de Buzz de esa comunidad. Distintas comunidades pueden vivir en el mismo
+  relay físico bajo hosts distintos, o en relays completamente separados.
+- `channel_id` — UUID del canal de prueba en esa comunidad. Se obtiene creándolo (kind 9007, `nak event
+  -k 9007 --tag "name=zap-test" --auth --sec <tu-privkey> ws://localhost:3000`) o desde la app de
+  escritorio de Buzz (Settings del canal → copiar ID).
+- `lawallet_base_url` — instancia de LaWallet de esa comunidad (por defecto local, `http://localhost:2288`,
+  puerto de `apps/web` en el compose de lawallet-nwc). El usuario destino del `/zap` (`@usuario`) debe
+  existir ahí con una Lightning Address activa (crearlo desde la UI de LaWallet o `pnpm seed` en ese repo).
+- `triggers` — igual que antes (`manual_zap_command`, `reaction_added`, `agent_task_completed`).
+- `repo_coord`, `db_path` — opcionales, ver comentarios en `config/communities.example.yaml`.
 
 ## Test end-to-end manual
 
+`<BUZZ_CHANNEL_ID>` abajo es el `channel_id` que pusiste en `config/communities.yaml` para esa comunidad
+(ya no es una variable de entorno).
+
 1. Con los tres servicios arriba, uní al bot y a un usuario de prueba al canal de Buzz
-   (`BUZZ_CHANNEL_ID`).
+   (`<BUZZ_CHANNEL_ID>`).
 2. Desde el cliente de Buzz (desktop o `nak`), escribí un mensaje que mencione a ese usuario con
    `@username` (el cliente debe agregar el tag `p` automáticamente) y contenga `/zap @username 100`.
    Con `nak`:
@@ -248,7 +313,7 @@ eventos kind:9734/9735 — no reemplazan este flujo manual, que requiere las tre
 ### Fase 2: reacción → zap
 
 1. El usuario que va a recibir zaps corre `/link su-username` una vez en el canal.
-2. Cualquiera reacciona con 🐝 (o el emoji configurado en `config/triggers.example.yaml`) a un mensaje
+2. Cualquiera reacciona con 🐝 (o el emoji configurado en `config/communities.example.yaml`) a un mensaje
    de ese usuario:
    ```bash
    nak event -k 7 -c "🐝" --tag "h=<BUZZ_CHANNEL_ID>" --tag "e=<id-del-mensaje>" \
@@ -305,9 +370,10 @@ src/
     store.ts              # SQLite — auditoría de zaps (pending/paid/expired/failed) + hasSourceEvent (idempotencia)
     links.ts               # SQLite — pubkey -> username de LaWallet (self-registrado con /link)
     bounties.ts             # SQLite — bounties abiertos/pagados por PR (soft escrow, ver /bounty)
-  config.ts               # env + config/triggers.example.yaml
+  config.ts               # GlobalConfig (.env) + loadCommunities (config/communities.yaml)
+  index.ts                 # arranca N comunidades en paralelo — ver "Fase 2 — wallets por comunidad"
 config/
-  triggers.example.yaml   # triggers activos: manual_zap_command (documental) + reaction_added (en uso)
+  communities.example.yaml   # una entrada por comunidad: relay, canal, wallet LaWallet y triggers
 ```
 
 ## Próximos pasos (Fase 3, no implementados)
@@ -328,4 +394,6 @@ config/
   ningún evento que lo vuelva a disparar (el merge solo ocurre una vez). Falta un comando manual de
   reintento o un job periódico.
 - Middleware de fee (1-2% por zap) y dashboard de administración por comunidad.
-- Wallets por comunidad (spec sección 5.5) en vez de una sola `LAWALLET_BASE_URL` fija.
+- Resiliencia de arranque multi-comunidad: hoy si una sola comunidad falla al conectar (relay caído, host
+  mal configurado), `Promise.all` tira abajo el proceso entero — ninguna comunidad queda online. Para un
+  despliegue con muchos clientes reales conviene que una comunidad rota no tumbe a las demás.

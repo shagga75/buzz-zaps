@@ -1,6 +1,6 @@
-import { loadConfig, loadTriggersConfig } from './config.js';
-import { createLogger } from './logger.js';
-import { loadBotIdentity } from './nostr/identity.js';
+import { loadGlobalConfig, loadCommunities, type AppConfig, type TriggersFile } from './config.js';
+import { createLogger, type Logger } from './logger.js';
+import { loadBotIdentity, type BotIdentity } from './nostr/identity.js';
 import { connectAndAuthenticate, subscribeToChannel, subscribeGlobal } from './bot/relay-client.js';
 import { handleChannelMessage } from './bot/zap-flow.js';
 import { handleLinkCommand } from './bot/link-flow.js';
@@ -21,21 +21,38 @@ import { BountyStore } from './db/bounties.js';
 const CHANNEL_MESSAGE_KINDS = [9, 40002];
 const REACTION_KIND = 7;
 
-async function main() {
-  const config = loadConfig();
-  const logger = createLogger(config.logLevel);
-  const bot = loadBotIdentity(config.botNsec);
-  const triggers = loadTriggersConfig(config.triggersConfigPath);
+interface CommunityHandle {
+  name: string;
+  relay: Awaited<ReturnType<typeof connectAndAuthenticate>>;
+  store: ZapStore;
+  links: LinkStore;
+  bounties: BountyStore;
+}
 
-  logger.info({ pubkey: bot.pubkey, channelId: config.channelId }, 'starting buzz-zaps');
-
-  const store = new ZapStore(config.dbPath);
-  const links = new LinkStore(config.dbPath);
-  const bounties = new BountyStore(config.dbPath);
+/**
+ * Boots one community end to end: its own relay connection (a community is
+ * resolved server-side from the connection's host, so this can't be shared
+ * across communities), its own LaWallet client, its own SQLite stores, and
+ * the same command/trigger wiring every community gets.
+ */
+async function startCommunity(
+  name: string,
+  config: AppConfig,
+  triggers: TriggersFile,
+  repoCoord: string | undefined,
+  dbPath: string,
+  bot: BotIdentity,
+  logger: Logger,
+): Promise<CommunityHandle> {
+  const store = new ZapStore(dbPath);
+  const links = new LinkStore(dbPath);
+  const bounties = new BountyStore(dbPath);
   const lawallet = new LaWalletClient(config.lawalletBaseUrl, logger);
   const relay = await connectAndAuthenticate(config.buzzRelayUrl, bot.secretKey, logger);
   const authorCache = new MessageAuthorCache();
   const agentCache = new AgentPubkeyCache();
+
+  logger.info({ pubkey: bot.pubkey, channelId: config.channelId }, 'community online');
 
   // Channel-scoped: the manual /zap, /link, /bounty commands and reaction triggers.
   subscribeToChannel(
@@ -83,7 +100,9 @@ async function main() {
 
   // Not channel-scoped: NIP-34 git status events live in the repo/community
   // namespace, not under any `h` tag (confirmed in buzz-relay's
-  // requires_h_channel_scope — git kinds aren't in that list).
+  // requires_h_channel_scope — git kinds aren't in that list). Still safe to
+  // reuse this community's own relay connection: the relay's host-resolved
+  // community boundary applies to every subscription on it, scoped or not.
   subscribeGlobal(
     relay,
     [KIND_GIT_STATUS_MERGED],
@@ -93,15 +112,34 @@ async function main() {
       });
     },
     logger,
-    config.repoCoord,
+    repoCoord,
+  );
+
+  return { name, relay, store, links, bounties };
+}
+
+async function main() {
+  const global = loadGlobalConfig();
+  const rootLogger = createLogger(global.logLevel);
+  const bot = loadBotIdentity(global.botNsec);
+  const communities = loadCommunities(global.communitiesConfigPath, global);
+
+  rootLogger.info({ pubkey: bot.pubkey, communities: communities.map((c) => c.name) }, 'starting buzz-zaps');
+
+  const handles = await Promise.all(
+    communities.map((c) =>
+      startCommunity(c.name, c.config, c.triggers, c.repoCoord, c.dbPath, bot, rootLogger.child({ community: c.name })),
+    ),
   );
 
   const shutdown = () => {
-    logger.info('shutting down');
-    relay.close();
-    store.close();
-    links.close();
-    bounties.close();
+    rootLogger.info('shutting down');
+    for (const handle of handles) {
+      handle.relay.close();
+      handle.store.close();
+      handle.links.close();
+      handle.bounties.close();
+    }
     process.exit(0);
   };
   process.on('SIGINT', shutdown);

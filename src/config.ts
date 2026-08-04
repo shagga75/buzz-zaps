@@ -3,61 +3,61 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 
 const envSchema = z.object({
-  BUZZ_RELAY_URL: z.string().url(),
   BUZZ_BOT_NSEC: z.string().startsWith('nsec1'),
-  BUZZ_CHANNEL_ID: z.string().min(1, 'BUZZ_CHANNEL_ID is required (test channel UUID)'),
-  LAWALLET_BASE_URL: z.string().url(),
   LAWALLET_VERIFY_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(2000),
   LAWALLET_VERIFY_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
-  DB_PATH: z.string().default('./data/buzz-zaps.sqlite3'),
-  TRIGGERS_CONFIG_PATH: z.string().default('./config/triggers.example.yaml'),
+  // Base directory for each community's SQLite file, used when a community
+  // entry doesn't set its own `db_path`. Per-community DB isolation matters
+  // once one process serves several communities — see loadCommunities().
+  DB_DIR: z.string().default('./data'),
+  COMMUNITIES_CONFIG_PATH: z.string().default('./config/communities.example.yaml'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   ZAP_RECEIPT_EXTRA_RELAYS: z.string().default(''),
-  // NIP-34 repo coordinate ("30617:<owner-hex>:<repo-d>", the `a`-tag value
-  // pointing at the repo's kind:30617 announcement) to scope bounty payouts
-  // to one repo. Unset watches every merged PR in the community — fine for
-  // a single-repo test setup, but a real multi-repo Buzz instance will want
-  // this set.
-  BUZZ_REPO_COORD: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
 
-export interface AppConfig {
-  buzzRelayUrl: string;
+/** Config shared across every community this process serves. */
+export interface GlobalConfig {
   botNsec: string;
-  channelId: string;
-  lawalletBaseUrl: string;
   verifyPollIntervalMs: number;
   verifyTimeoutMs: number;
-  dbPath: string;
+  dbDir: string;
+  communitiesConfigPath: string;
   logLevel: Env['LOG_LEVEL'];
   zapReceiptExtraRelays: string[];
-  triggersConfigPath: string;
-  repoCoord: string | undefined;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+export function loadGlobalConfig(env: NodeJS.ProcessEnv = process.env): GlobalConfig {
   const parsed = envSchema.parse(env);
   return {
-    buzzRelayUrl: parsed.BUZZ_RELAY_URL,
     botNsec: parsed.BUZZ_BOT_NSEC,
-    channelId: parsed.BUZZ_CHANNEL_ID,
-    lawalletBaseUrl: parsed.LAWALLET_BASE_URL.replace(/\/$/, ''),
     verifyPollIntervalMs: parsed.LAWALLET_VERIFY_POLL_INTERVAL_MS,
     verifyTimeoutMs: parsed.LAWALLET_VERIFY_TIMEOUT_MS,
-    dbPath: parsed.DB_PATH,
+    dbDir: parsed.DB_DIR,
+    communitiesConfigPath: parsed.COMMUNITIES_CONFIG_PATH,
     logLevel: parsed.LOG_LEVEL,
     zapReceiptExtraRelays: parsed.ZAP_RECEIPT_EXTRA_RELAYS.split(',')
       .map((relay) => relay.trim())
       .filter(Boolean),
-    triggersConfigPath: parsed.TRIGGERS_CONFIG_PATH,
-    repoCoord: parsed.BUZZ_REPO_COORD,
   };
 }
 
-// --- Fase 2 scaffolding: triggers.yaml schema (only `manual_zap_command` is
-// active in the MVP; the rest documents the shape triggers will need later). ---
+/**
+ * What the bot handlers (zap-flow, reaction-flow, bounty-flow,
+ * task-completion-flow, link-flow) actually read — one instance per
+ * community. Deliberately doesn't carry `repoCoord`/`dbPath`/triggers:
+ * those are only needed by index.ts to bootstrap a community, never by a
+ * handler mid-flow.
+ */
+export interface AppConfig {
+  buzzRelayUrl: string;
+  channelId: string;
+  lawalletBaseUrl: string;
+  verifyPollIntervalMs: number;
+  verifyTimeoutMs: number;
+  zapReceiptExtraRelays: string[];
+}
 
 const triggerSchema = z.discriminatedUnion('on', [
   z.object({
@@ -80,14 +80,78 @@ const triggerSchema = z.discriminatedUnion('on', [
   }),
 ]);
 
-const triggersFileSchema = z.object({
-  community: z.string().optional(),
+export type Trigger = z.infer<typeof triggerSchema>;
+
+/** Shape reaction-flow.ts and task-completion-flow.ts match rules against. */
+export interface TriggersFile {
+  triggers: Trigger[];
+}
+
+// A Buzz "community" is resolved server-side from the connection's Host
+// header (see TenantContext in buzz-core/src/tenant.rs) — it's never
+// something a client picks per-channel. So one process serving N
+// communities means N independent relay connections (one per community's
+// host), each authenticated separately and each free to point at its own
+// LaWallet instance. `relay_url` and `lawallet_base_url` are therefore
+// per-community, not global env vars.
+const communityEntrySchema = z.object({
+  name: z.string().min(1),
+  relay_url: z.string().url(),
+  channel_id: z.string().min(1),
+  lawallet_base_url: z.string().url(),
+  // NIP-34 repo coordinate ("30617:<owner-hex>:<repo-d>") to scope this
+  // community's bounty payouts to one repo. Unset watches every merged PR
+  // this community's relay connection can see.
+  repo_coord: z.string().optional(),
+  // Defaults to `${DB_DIR}/${name}.sqlite3` — see resolveCommunities().
+  db_path: z.string().optional(),
   triggers: z.array(triggerSchema).default([]),
 });
 
-export type TriggersFile = z.infer<typeof triggersFileSchema>;
+const communitiesFileSchema = z
+  .object({
+    communities: z.array(communityEntrySchema).min(1, 'communities.yaml must declare at least one community'),
+  })
+  .superRefine((val, ctx) => {
+    const seen = new Set<string>();
+    val.communities.forEach((community, index) => {
+      if (seen.has(community.name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `duplicate community name "${community.name}" — names must be unique (used to derive the default db_path)`,
+          path: ['communities', index, 'name'],
+        });
+      }
+      seen.add(community.name);
+    });
+  });
 
-export function loadTriggersConfig(path: string): TriggersFile {
+export type CommunityEntry = z.infer<typeof communityEntrySchema>;
+
+/** A fully-resolved community, ready to hand to index.ts's per-community bootstrap. */
+export interface ResolvedCommunity {
+  name: string;
+  config: AppConfig;
+  repoCoord: string | undefined;
+  dbPath: string;
+  triggers: TriggersFile;
+}
+
+export function loadCommunities(path: string, global: GlobalConfig): ResolvedCommunity[] {
   const raw = readFileSync(path, 'utf-8');
-  return triggersFileSchema.parse(parseYaml(raw));
+  const parsed = communitiesFileSchema.parse(parseYaml(raw));
+  return parsed.communities.map((community) => ({
+    name: community.name,
+    config: {
+      buzzRelayUrl: community.relay_url,
+      channelId: community.channel_id,
+      lawalletBaseUrl: community.lawallet_base_url.replace(/\/$/, ''),
+      verifyPollIntervalMs: global.verifyPollIntervalMs,
+      verifyTimeoutMs: global.verifyTimeoutMs,
+      zapReceiptExtraRelays: global.zapReceiptExtraRelays,
+    },
+    repoCoord: community.repo_coord,
+    dbPath: community.db_path ?? `${global.dbDir}/${community.name}.sqlite3`,
+    triggers: { triggers: community.triggers },
+  }));
 }
