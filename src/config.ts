@@ -57,6 +57,15 @@ export interface AppConfig {
   verifyPollIntervalMs: number;
   verifyTimeoutMs: number;
   zapReceiptExtraRelays: string[];
+  /** Fase 3 fee middleware, per community — see runZapFlow in zap-flow.ts. Absent when this community charges no fee. */
+  fee?: FeeConfig;
+}
+
+export interface FeeConfig {
+  /** Basis points (100 = 1%), same convention LaWallet's own proxyAlias fee uses. */
+  bps: number;
+  /** LaWallet username that receives the fee invoice — buzz-zaps' own address, same pattern as agent_task_completed's service_username. */
+  serviceUsername: string;
 }
 
 const triggerSchema = z.discriminatedUnion('on', [
@@ -105,6 +114,14 @@ const communityEntrySchema = z.object({
   repo_coord: z.string().optional(),
   // Defaults to `${DB_DIR}/${name}.sqlite3` — see resolveCommunities().
   db_path: z.string().optional(),
+  // Fase 3 fee middleware: charges a second, separate invoice (fee_bps basis
+  // points of the zap amount) to fee_service_username whenever this
+  // community's triggers pay out to someone else. Both fields are required
+  // together — a fee percentage with nowhere to send it (or vice versa) is a
+  // config mistake, not a valid "fee disabled" state, so it's rejected below
+  // rather than silently defaulting.
+  fee_bps: z.number().int().min(1).max(1000).optional(),
+  fee_service_username: z.string().min(1).optional(),
   triggers: z.array(triggerSchema).default([]),
 });
 
@@ -123,6 +140,14 @@ const communitiesFileSchema = z
         });
       }
       seen.add(community.name);
+
+      if ((community.fee_bps === undefined) !== (community.fee_service_username === undefined)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'fee_bps and fee_service_username must be set together (or neither, to disable the fee)',
+          path: ['communities', index, community.fee_bps === undefined ? 'fee_bps' : 'fee_service_username'],
+        });
+      }
     });
   });
 
@@ -149,6 +174,10 @@ export function loadCommunities(path: string, global: GlobalConfig): ResolvedCom
       verifyPollIntervalMs: global.verifyPollIntervalMs,
       verifyTimeoutMs: global.verifyTimeoutMs,
       zapReceiptExtraRelays: global.zapReceiptExtraRelays,
+      fee:
+        community.fee_bps !== undefined && community.fee_service_username !== undefined
+          ? { bps: community.fee_bps, serviceUsername: community.fee_service_username }
+          : undefined,
     },
     repoCoord: community.repo_coord,
     dbPath: community.db_path ?? `${global.dbDir}/${community.name}.sqlite3`,

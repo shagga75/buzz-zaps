@@ -98,4 +98,46 @@ communities:
     const path = writeCommunitiesYaml('communities: []\n');
     expect(() => loadCommunities(path, global)).toThrow();
   });
+
+  it('resolves fee_bps/fee_service_username into a FeeConfig, and leaves it undefined when neither is set', () => {
+    const path = writeCommunitiesYaml(`
+communities:
+  - name: with-fee
+    relay_url: ws://a.example:3000
+    channel_id: chan-a
+    lawallet_base_url: http://lawallet-a.example
+    fee_bps: 200
+    fee_service_username: buzz-zaps-fees
+  - name: without-fee
+    relay_url: ws://b.example:3000
+    channel_id: chan-b
+    lawallet_base_url: http://lawallet-b.example
+`);
+    const communities = loadCommunities(path, global);
+
+    expect(communities[0].config.fee).toEqual({ bps: 200, serviceUsername: 'buzz-zaps-fees' });
+    expect(communities[1].config.fee).toBeUndefined();
+  });
+
+  it('rejects fee_bps set without fee_service_username (and vice versa)', () => {
+    const onlyBps = writeCommunitiesYaml(`
+communities:
+  - name: broken
+    relay_url: ws://a.example:3000
+    channel_id: chan-a
+    lawallet_base_url: http://lawallet-a.example
+    fee_bps: 200
+`);
+    expect(() => loadCommunities(onlyBps, global)).toThrow(/fee_bps and fee_service_username must be set together/);
+
+    const onlyUsername = writeCommunitiesYaml(`
+communities:
+  - name: broken
+    relay_url: ws://a.example:3000
+    channel_id: chan-a
+    lawallet_base_url: http://lawallet-a.example
+    fee_service_username: buzz-zaps-fees
+`);
+    expect(() => loadCommunities(onlyUsername, global)).toThrow(/fee_bps and fee_service_username must be set together/);
+  });
 });

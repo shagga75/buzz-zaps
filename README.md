@@ -21,6 +21,10 @@ simultáneo, cada una con su propia conexión al relay, su propia instancia de L
 triggers — sin estado compartido entre ellas salvo la identidad Nostr del bot (`config/communities.yaml`,
 ver "Fase 2 — wallets por comunidad").
 
+Fee middleware (Fase 3, implementada): cada comunidad puede cobrar un fee (`fee_bps`, ej. 200 = 2%) sobre
+cada zap que paga a un tercero — un segundo invoice independiente a la wallet propia de `buzz-zaps`, no un
+descuento del pago principal (ver "Fase 3 — fee middleware" para el porqué).
+
 ## Por qué está construido así (hallazgos antes de codear)
 
 Antes de escribir código se clonaron y auditaron ambos forks. Resumen:
@@ -233,6 +237,38 @@ sola: nada impide autenticar la misma clave contra relays/hosts distintos.
    127.0.0.1:2299` — la prueba de que nunca cayó de vuelta a la wallet real de la otra comunidad.
 6. `ls data/` mostró `buzz-zaps-test.sqlite3` y `buzz-zaps-test-b.sqlite3` como archivos separados.
 
+## Fase 3 — fee middleware
+
+`fee_bps`/`fee_service_username` en la entrada de una comunidad (`config/communities.yaml`) le cobra a
+esa comunidad un fee sobre cada zap que paga a un tercero — 200 bps = 2%.
+
+**Por qué son dos invoices separados y no un split dentro de uno solo**: antes de codear se investigó si
+LaWallet tiene algún primitivo de split-payment que un tercero externo pueda usar vía LUD-16/21 — no lo
+tiene. Lo único parecido es su propio modo `PROXY_ALIAS` (`lib/proxy/*` en lawallet-nwc): el operador de
+esa instancia LaWallet recibe el pago bruto en su propia wallet NWC y recién ahí paga el neto al destino
+con un segundo pago Lightning — un *receive-then-forward* real, pero **custodial**, y solo invocable por
+quien administra esa instancia de LaWallet, no por un bridge externo como `buzz-zaps`. Copiar ese patrón
+acá habría exigido que `buzz-zaps` tuviera su propia wallet NWC con permiso de **enviar** pagos (hoy solo
+pide invoices, nunca paga uno) y retuviera fondos aunque sea brevemente — cambia el modelo de negocio ya
+publicado ("no custodiamos fondos"), no es un detalle de implementación.
+
+**Cómo quedó**: `runZapFlow` (el mismo flujo que usan los cuatro triggers) pide, además del invoice
+normal, un segundo invoice independiente por `floor(amount_sats * fee_bps / 10000)` sats a
+`fee_service_username` (misma dirección propia de `buzz-zaps` que usa `agent_task_completed`), y lo
+publica como una segunda respuesta en el canal. Es honor-system a propósito, igual que el cobro por tarea
+completada: nadie lo obliga a pagarse, `buzz-zaps` no lo trackea ni lo bloquea, y el zap receipt (kind
+9735) sigue dependiendo únicamente de que se pague el invoice principal.
+
+Guardas en `chargeFeeIfConfigured` (`src/bot/zap-flow.ts`):
+- **No hay fee sobre un fee**: si el trigger ya le está pagando a la wallet de fees (es lo que hace
+  `agent_task_completed` con su `service_username`, si coincidiera con `fee_service_username`), no se pide
+  un segundo invoice.
+- **Montos que redondean a 0** (zaps chicos con un `fee_bps` bajo) no generan un invoice — no vale la pena
+  un segundo pago por 0 sats.
+- **Si el pedido del invoice de fee falla** (LaWallet caído, username mal configurado), se loguea un
+  warning y el flujo principal sigue intacto — un fee roto nunca debe tumbar el zap que el usuario
+  realmente pidió.
+
 ## Setup local
 
 Asumiendo los tres repos como hermanos (ver spec sección 7):
@@ -353,7 +389,7 @@ src/
   bot/
     relay-client.ts          # conectar + auth NIP-42 + suscribir(canal)/suscribir(global)/publicar/fetchEventById
     command-parser.ts        # detectar "/zap @user <monto>", "/link <username>", "/bounty <id> <monto>"
-    zap-flow.ts               # runZapFlow compartido — invoice → reply → poll → receipt (devuelve el outcome)
+    zap-flow.ts               # runZapFlow compartido — invoice → fee opcional → reply → poll → receipt (devuelve el outcome)
     link-flow.ts               # handler de /link
     reaction-flow.ts            # handler de reacciones (Fase 2), matchea contra triggers.yaml
     bounty-flow.ts               # handler de /bounty + payout al detectar kind:1631 (NIP-34, Fase 2)
@@ -376,7 +412,7 @@ config/
   communities.example.yaml   # una entrada por comunidad: relay, canal, wallet LaWallet y triggers
 ```
 
-## Próximos pasos (Fase 3, no implementados)
+## Próximos pasos
 
 - **Contribuir el evento formal de "task completed" río arriba a `buzz`**: hoy `agent_task_completed`
   detecta un reply de agente como proxy porque `KIND_WORKFLOW_COMPLETED`/`KIND_JOB_RESULT` no se publican
@@ -393,7 +429,11 @@ config/
 - Reintento de bounties fallidos: si el pago timeoutea o falla, el bounty queda `open` pero no hay
   ningún evento que lo vuelva a disparar (el merge solo ocurre una vez). Falta un comando manual de
   reintento o un job periódico.
-- Middleware de fee (1-2% por zap) y dashboard de administración por comunidad.
+- Dashboard de administración por comunidad (ver montos de fee cobrados, triggers activos, etc. — hoy solo
+  se puede inspeccionar editando `communities.yaml` y leyendo logs).
+- El fee (Fase 3) es honor-system: nada obliga a pagar el segundo invoice, ni se trackea si se pagó o no.
+  Para hacerlo real habría que, como mínimo, pollear también el invoice de fee y loguear/alertar cuando no
+  se paga — no bloquear el zap principal por eso, pero sí tener visibilidad.
 - Resiliencia de arranque multi-comunidad: hoy si una sola comunidad falla al conectar (relay caído, host
   mal configurado), `Promise.all` tira abajo el proceso entero — ninguna comunidad queda online. Para un
   despliegue con muchos clientes reales conviene que una comunidad rota no tumbe a las demás.

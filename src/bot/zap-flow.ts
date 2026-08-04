@@ -49,6 +49,39 @@ export interface ZapRequest {
 
 export type ZapOutcome = 'paid' | 'expired' | 'invoice_failed';
 
+/**
+ * Fase 3 fee middleware: requests a second, separate invoice for
+ * `fee_bps` of the zap amount, payable to the community's own
+ * `fee_service_username` — see README "Fase 3 — fee middleware" for why
+ * this is a second invoice rather than a split within the main one (LaWallet
+ * has no split-payment primitive an external LUD-16 consumer can reach).
+ *
+ * Best-effort and non-blocking on purpose: a fee invoice failing (LaWallet
+ * flakiness, misconfigured username) must never affect the main zap, which
+ * is the thing users actually asked buzz-zaps to do. Nothing polls whether
+ * the fee gets paid — it's the same honor-system pattern as
+ * agent_task_completed's charge, not an enforced deduction.
+ */
+async function chargeFeeIfConfigured(req: ZapRequest, deps: ZapFlowDeps, reply: (content: string) => Promise<void>, log: Logger): Promise<void> {
+  const { config, lawallet } = deps;
+  if (!config.fee) return;
+  if (req.targetUsername === config.fee.serviceUsername) return; // already paying the fee wallet itself — no fee on a fee
+
+  const feeSats = Math.floor((req.amountSats * config.fee.bps) / 10_000);
+  if (feeSats < 1) return; // rounds to 0 for small zaps — not worth a second invoice
+
+  try {
+    const feeInvoice = await lawallet.requestInvoice(
+      config.fee.serviceUsername,
+      feeSats,
+      `buzz-zaps fee (${config.fee.bps / 100}%) on a ${req.amountSats}-sat zap to @${req.targetUsername}`,
+    );
+    await reply(`💰 Fee (${config.fee.bps / 100}%): invoice for ${feeSats} sats to @${config.fee.serviceUsername}:\n\n${feeInvoice.bolt11}`);
+  } catch (err) {
+    log.warn({ err, feeSats }, 'fee invoice request failed — continuing without it, the main zap is unaffected');
+  }
+}
+
 export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<ZapOutcome> {
   const { relay, config, botSecretKey, lawallet, store, logger } = deps;
   const log = logger.child({ sourceEventId: req.sourceEventId, target: req.targetUsername, amountSats: req.amountSats });
@@ -87,6 +120,8 @@ export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<Za
   });
 
   await reply(`⚡ Invoice for ${req.amountSats} sats to @${req.targetUsername}:\n\n${invoice.bolt11}`);
+
+  await chargeFeeIfConfigured(req, deps, reply, log);
 
   const zapRequest = buildSyntheticZapRequest(
     {
