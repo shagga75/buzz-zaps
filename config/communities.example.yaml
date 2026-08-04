@@ -35,12 +35,27 @@
 # message. `service_username` is buzz-zaps' own LaWallet address (not the
 # invoking human's) — see README "Fase 2 — cobro automático" for why this is
 # a charge *request*, not an auto-debit.
+#
+# `fee_bps`/`fee_service_username` (Fase 3, implementada): charges a SEPARATE
+# invoice for `fee_bps` basis points (200 = 2%) of every zap this community
+# pays out to someone else, to `fee_service_username` — buzz-zaps' own
+# address again, same pattern as `service_username` above. Both fields are
+# required together; leave both unset to run this community fee-free. This
+# is two independent invoices, not a split within one payment: LaWallet has
+# no split-payment primitive reachable from outside its own operator (its
+# `PROXY_ALIAS` receive-then-forward mode is real but requires *being* the
+# LaWallet operator with a funded NWC wallet that can send, not just
+# receive — a materially different, custodial design we deliberately did
+# not take; confirmed by reading `lib/proxy/*` before choosing the
+# two-invoice approach). See README "Fase 3 — fee middleware".
 
 communities:
   - name: buzz-zaps-test
     relay_url: ws://localhost:3000
     channel_id: bd05a9e5-a869-450a-9e22-5b5705c6a714
     lawallet_base_url: http://localhost:2288
+    fee_bps: 200
+    fee_service_username: buzz-zaps-fees
 
     triggers:
       - on: manual_zap_command
