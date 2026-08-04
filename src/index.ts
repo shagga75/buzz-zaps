@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { loadGlobalConfig, loadCommunities, type AppConfig, type TriggersFile } from './config.js';
 import { createLogger, type Logger } from './logger.js';
 import { loadBotIdentity, type BotIdentity } from './nostr/identity.js';
@@ -21,12 +22,38 @@ import { BountyStore } from './db/bounties.js';
 const CHANNEL_MESSAGE_KINDS = [9, 40002];
 const REACTION_KIND = 7;
 
-interface CommunityHandle {
+export interface CommunityHandle {
   name: string;
   relay: Awaited<ReturnType<typeof connectAndAuthenticate>>;
   store: ZapStore;
   links: LinkStore;
   bounties: BountyStore;
+}
+
+/**
+ * Splits Promise.allSettled results into the handles that started
+ * successfully, logging (not throwing on) each rejection. Pulled out of
+ * main() so the fail-soft decision — one bad community's rejection must
+ * never take the healthy ones down with it — is testable without spinning
+ * up real relay connections.
+ */
+export function partitionStartResults(
+  results: PromiseSettledResult<CommunityHandle>[],
+  communityNames: string[],
+  logger: Logger,
+): CommunityHandle[] {
+  const handles: CommunityHandle[] = [];
+  for (const [index, result] of results.entries()) {
+    if (result.status === 'fulfilled') {
+      handles.push(result.value);
+    } else {
+      logger.error(
+        { community: communityNames[index], err: result.reason },
+        'community failed to start — continuing with the communities that did',
+      );
+    }
+  }
+  return handles;
 }
 
 /**
@@ -126,11 +153,31 @@ async function main() {
 
   rootLogger.info({ pubkey: bot.pubkey, communities: communities.map((c) => c.name) }, 'starting buzz-zaps');
 
-  const handles = await Promise.all(
+  // Fail-soft on purpose: one community with a bad relay host or an
+  // unreachable relay must not take every other, healthy community down
+  // with it. Promise.allSettled (not Promise.all) so a rejection from one
+  // startCommunity() call doesn't abort the others — each is independent
+  // (its own relay connection, its own stores), so there's no shared state
+  // a partial failure could leave inconsistent.
+  const results = await Promise.allSettled(
     communities.map((c) =>
       startCommunity(c.name, c.config, c.triggers, c.repoCoord, c.dbPath, bot, rootLogger.child({ community: c.name })),
     ),
   );
+
+  const handles = partitionStartResults(
+    results,
+    communities.map((c) => c.name),
+    rootLogger,
+  );
+
+  // A process serving zero communities isn't degraded, it's useless —
+  // that's the one case worth failing hard on, since every startCommunity()
+  // rejection already got logged above with the reason.
+  if (handles.length === 0) {
+    rootLogger.error('every community failed to start — nothing to serve, exiting');
+    process.exit(1);
+  }
 
   const shutdown = () => {
     rootLogger.info('shutting down');
@@ -146,7 +193,14 @@ async function main() {
   process.on('SIGTERM', shutdown);
 }
 
-main().catch((err) => {
-  console.error('fatal error starting buzz-zaps:', err);
-  process.exit(1);
-});
+// Only run main() when this file is executed directly (`tsx src/index.ts` /
+// `node dist/index.js`), not when it's imported — e.g. test/index.test.ts
+// imports partitionStartResults for unit testing and must not trigger a
+// real startup (env/config loading, real relay connections) as a side
+// effect of that import.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error('fatal error starting buzz-zaps:', err);
+    process.exit(1);
+  });
+}
