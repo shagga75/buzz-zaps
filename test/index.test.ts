@@ -4,7 +4,15 @@ import { partitionStartResults, type CommunityHandle } from '../src/index.js';
 const noopLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: () => noopLogger } as any;
 
 function fakeHandle(name: string): CommunityHandle {
-  return { name, relay: {} as any, store: {} as any, links: {} as any, bounties: {} as any };
+  return {
+    name,
+    relay: {} as any,
+    store: {} as any,
+    links: {} as any,
+    bounties: {} as any,
+    stopWatchingConnection: vi.fn(),
+    prepareForShutdown: vi.fn(),
+  };
 }
 
 describe('partitionStartResults', () => {

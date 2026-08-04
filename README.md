@@ -325,6 +325,42 @@ riesgo que ya existe (acceso al server) — cero superficie nueva. Para cambiar 
 pedido tuvo éxito. Ese fallo hoy solo queda en los logs. El reporte lo dice explícitamente en vez de
 mostrar un número que parezca completo y no lo sea.
 
+## Reconexión post-arranque
+
+PR #9 (Fase 3) solo cubrió fallar al *conectar*. Si una comunidad ya online pierde la conexión después
+(el relay se reinicia, se cae la red), quedaba muda hasta reiniciar todo el proceso — este es el fix.
+
+**Lo que ya venía gratis**: antes de escribir nada se leyó `abstract-relay.js` de `nostr-tools` — ya
+implementa reconexión con backoff (capeado a 60s, reintenta para siempre), re-autenticación NIP-42
+automática (Buzz reenvía el challenge AUTH en cada conexión nueva, y `relay.onauth` sigue enganchado), y
+re-dispara cada subscription que seguía abierta al momento del corte, retomando con `since` en vez de
+reprocesar todo el historial. Activarlo es un solo flag: `Relay.connect(url, { enableReconnect: true })`.
+Escribir esto de cero hubiera sido reinventar algo que la librería ya da gratis.
+
+**El bug real, encontrado solo en vivo**: `nostr-tools` re-dispara las subscriptions abiertas apenas el
+WebSocket abre (`ws.onopen`) — pero eso puede pasar *antes* de que termine el re-auth NIP-42. El relay
+cierra esa re-suscripción prematura con `CLOSED "auth-required: not authenticated"`, y una subscription
+cerrada así queda **eliminada** del tracking interno de `nostr-tools` — nunca se vuelve a intentar sola,
+ni en la próxima reconexión. Sin arreglar esto, una comunidad podía quedar con la conexión "viva"
+(`relay.connected === true`) pero sorda para siempre. Esto no se veía leyendo el código ni los tipos —
+recién apareció corriendo el escenario real (matar el proceso del relay a mitad de sesión, resucitarlo, y
+mirar los logs).
+
+**El fix**: `subscribeToChannel`/`subscribeGlobal` (`relay-client.ts`) ahora aceptan un callback
+`onClose` opcional. `src/index.ts` lo usa para re-suscribir manualmente cuando el cierre no es el propio
+apagado del proceso (una flag `isShuttingDown`, seteada antes de `relay.close()`, distingue las dos
+razones). Delay fijo de 2s antes de reintentar — suficiente para dejar terminar el auth en carrera, sin
+backoff exponencial: es una ventana de carrera puntual, no una falla sostenida.
+
+**Visibilidad**: `watchConnectionState` (`relay-client.ts`) poll ea `relay.connected` cada 5s y loguea
+`relay connection lost`/`relay connection restored` — `nostr-tools` no expone ningún hook público de
+"me reconecté", así que sin esto la reconexión automática sería invisible en los logs.
+
+Live-testeado matando el proceso del relay a mitad de sesión: detectó la caída, quedó vivo sin crashear,
+reconectó solo al resucitar el relay, pisó la carrera de auth-required y re-suscribió sola (confirmado con
+un `/zap` nuevo después de que todo se asentó — se procesó exactamente una vez, sin duplicados
+persistentes).
+
 ## Setup local
 
 Asumiendo los tres repos como hermanos (ver spec sección 7):
@@ -443,7 +479,7 @@ eventos kind:9734/9735 — no reemplazan este flujo manual, que requiere las tre
 ```
 src/
   bot/
-    relay-client.ts          # conectar + auth NIP-42 + suscribir(canal)/suscribir(global)/publicar/fetchEventById/fetchChannelAdmins
+    relay-client.ts          # conectar (reconexión automática) + auth NIP-42 + suscribir(canal, resuscribe-on-close)/suscribir(global, ídem)/publicar/fetchEventById/fetchChannelAdmins/watchConnectionState
     command-parser.ts        # detectar "/zap @user <monto>", "/link <username>", "/bounty <id> <monto>"
     zap-flow.ts               # runZapFlow compartido — invoice → fee opcional → reply → poll → receipt (devuelve el outcome)
     link-flow.ts               # handler de /link
@@ -491,11 +527,9 @@ scripts/
 - El fee (Fase 3) es honor-system: nada obliga a pagar el segundo invoice, ni se trackea si se pagó o no.
   Para hacerlo real habría que, como mínimo, pollear también el invoice de fee y loguear/alertar cuando no
   se paga — no bloquear el zap principal por eso, pero sí tener visibilidad.
-- **Resiliencia de arranque solo cubre el momento de conectar, no después**: `src/index.ts` usa
-  `Promise.allSettled` — si una comunidad falla al arrancar (relay caído, host mal configurado), se loguea
-  el error y las demás siguen online (si todas fallan, el proceso sale con exit 1 en vez de quedar
-  colgado sirviendo nada). Decisión explícita: sin reintento automático — la comunidad rota queda afuera
-  hasta el próximo reinicio manual, mismo modelo que ya usa el resto del proyecto (arreglar config +
-  reiniciar). Lo que sigue sin resolver: si una comunidad se cae *después* de haber arrancado bien (el
-  relay se reinicia, la conexión se corta), no hay lógica de reconexión — la comunidad queda muda hasta
-  el próximo reinicio del proceso completo.
+- **Resiliencia de arranque**: `src/index.ts` usa `Promise.allSettled` — si una comunidad falla al
+  arrancar (relay caído, host mal configurado), se loguea el error y las demás siguen online (si todas
+  fallan, el proceso sale con exit 1). Decisión explícita: sin reintento automático — la comunidad rota
+  queda afuera hasta el próximo reinicio manual, mismo modelo que ya usa el resto del proyecto (arreglar
+  config + reiniciar). Una comunidad que se cae *después* de arrancar bien sí se reconecta sola —
+  ver "Reconexión post-arranque".

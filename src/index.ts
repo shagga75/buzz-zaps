@@ -2,7 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { loadGlobalConfig, loadCommunities, type AppConfig, type TriggersFile } from './config.js';
 import { createLogger, type Logger } from './logger.js';
 import { loadBotIdentity, type BotIdentity } from './nostr/identity.js';
-import { connectAndAuthenticate, subscribeToChannel, subscribeGlobal } from './bot/relay-client.js';
+import { connectAndAuthenticate, subscribeToChannel, subscribeGlobal, watchConnectionState } from './bot/relay-client.js';
 import { handleChannelMessage } from './bot/zap-flow.js';
 import { handleLinkCommand } from './bot/link-flow.js';
 import { handleReaction } from './bot/reaction-flow.js';
@@ -28,6 +28,9 @@ export interface CommunityHandle {
   store: ZapStore;
   links: LinkStore;
   bounties: BountyStore;
+  stopWatchingConnection: () => void;
+  /** Call before relay.close() so a subscription closed by our own shutdown doesn't trigger a resubscribe. */
+  prepareForShutdown: () => void;
 }
 
 /**
@@ -76,73 +79,109 @@ async function startCommunity(
   const bounties = new BountyStore(dbPath);
   const lawallet = new LaWalletClient(config.lawalletBaseUrl, logger);
   const relay = await connectAndAuthenticate(config.buzzRelayUrl, bot.secretKey, logger);
+  const stopWatchingConnection = watchConnectionState(relay, logger);
   const authorCache = new MessageAuthorCache();
   const agentCache = new AgentPubkeyCache();
 
   logger.info({ pubkey: bot.pubkey, channelId: config.channelId }, 'community online');
 
+  // A subscription that gets closed by the relay (not by us) has to be
+  // re-established manually. Confirmed live: right after a connection
+  // drop-and-reconnect, nostr-tools re-fires every subscription that was
+  // still open when the drop happened — but it does that on the WebSocket's
+  // own `onopen`, which can land before our NIP-42 re-auth completes. The
+  // relay then closes the premature resubscribe with CLOSED
+  // "auth-required: not authenticated" — and a closed subscription is
+  // removed from nostr-tools' internal tracking, so it will NOT be retried
+  // on any later reconnect either; it's gone until something resubscribes
+  // it. `isShuttingDown` distinguishes that from our own intentional
+  // `relay.close()` at shutdown, which closes every subscription too but
+  // must NOT trigger a resubscribe seconds before the process exits.
+  let isShuttingDown = false;
+  function resubscribeOnUnexpectedClose(reason: string, resubscribe: () => void) {
+    if (isShuttingDown) return;
+    logger.warn({ reason }, 'subscription closed unexpectedly, resubscribing');
+    setTimeout(resubscribe, 2_000);
+  }
+
   // Channel-scoped: the manual /zap, /link, /bounty commands and reaction triggers.
-  subscribeToChannel(
-    relay,
-    config.channelId,
-    [...CHANNEL_MESSAGE_KINDS, REACTION_KIND],
-    (event) => {
-      if (CHANNEL_MESSAGE_KINDS.includes(event.kind)) {
-        authorCache.set(event.id, event.pubkey);
-        void handleChannelMessage(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, logger }).catch((err) => {
-          logger.error({ err, eventId: event.id }, 'unhandled error processing /zap command');
-        });
-        void handleLinkCommand(event, { relay, config, botSecretKey: bot.secretKey, links, logger }).catch((err) => {
-          logger.error({ err, eventId: event.id }, 'unhandled error processing /link command');
-        });
-        void handleBountyCommand(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, bounties, logger }).catch((err) => {
-          logger.error({ err, eventId: event.id }, 'unhandled error processing /bounty command');
-        });
-        void handleAgentReply(event, {
-          relay,
-          config,
-          botPubkey: bot.pubkey,
-          botSecretKey: bot.secretKey,
-          lawallet,
-          store,
-          logger,
-          authorCache,
-          agentCache,
-          triggers,
-        }).catch((err) => {
-          logger.error({ err, eventId: event.id }, 'unhandled error processing agent task completion');
-        });
-        return;
-      }
-      if (event.kind === REACTION_KIND) {
-        void handleReaction(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, logger, authorCache, triggers }).catch(
-          (err) => {
-            logger.error({ err, eventId: event.id }, 'unhandled error processing reaction');
-          },
-        );
-      }
-    },
-    logger,
-  );
+  const subscribeChannel = () =>
+    subscribeToChannel(
+      relay,
+      config.channelId,
+      [...CHANNEL_MESSAGE_KINDS, REACTION_KIND],
+      (event) => {
+        if (CHANNEL_MESSAGE_KINDS.includes(event.kind)) {
+          authorCache.set(event.id, event.pubkey);
+          void handleChannelMessage(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, logger }).catch((err) => {
+            logger.error({ err, eventId: event.id }, 'unhandled error processing /zap command');
+          });
+          void handleLinkCommand(event, { relay, config, botSecretKey: bot.secretKey, links, logger }).catch((err) => {
+            logger.error({ err, eventId: event.id }, 'unhandled error processing /link command');
+          });
+          void handleBountyCommand(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, bounties, logger }).catch((err) => {
+            logger.error({ err, eventId: event.id }, 'unhandled error processing /bounty command');
+          });
+          void handleAgentReply(event, {
+            relay,
+            config,
+            botPubkey: bot.pubkey,
+            botSecretKey: bot.secretKey,
+            lawallet,
+            store,
+            logger,
+            authorCache,
+            agentCache,
+            triggers,
+          }).catch((err) => {
+            logger.error({ err, eventId: event.id }, 'unhandled error processing agent task completion');
+          });
+          return;
+        }
+        if (event.kind === REACTION_KIND) {
+          void handleReaction(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, logger, authorCache, triggers }).catch(
+            (err) => {
+              logger.error({ err, eventId: event.id }, 'unhandled error processing reaction');
+            },
+          );
+        }
+      },
+      logger,
+      (reason) => resubscribeOnUnexpectedClose(reason, subscribeChannel),
+    );
+  subscribeChannel();
 
   // Not channel-scoped: NIP-34 git status events live in the repo/community
   // namespace, not under any `h` tag (confirmed in buzz-relay's
   // requires_h_channel_scope — git kinds aren't in that list). Still safe to
   // reuse this community's own relay connection: the relay's host-resolved
   // community boundary applies to every subscription on it, scoped or not.
-  subscribeGlobal(
-    relay,
-    [KIND_GIT_STATUS_MERGED],
-    (event) => {
-      void handleMergeStatus(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, bounties, logger }).catch((err) => {
-        logger.error({ err, eventId: event.id }, 'unhandled error processing merge status');
-      });
-    },
-    logger,
-    repoCoord,
-  );
+  const subscribeGlobalFeed = () =>
+    subscribeGlobal(
+      relay,
+      [KIND_GIT_STATUS_MERGED],
+      (event) => {
+        void handleMergeStatus(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, bounties, logger }).catch((err) => {
+          logger.error({ err, eventId: event.id }, 'unhandled error processing merge status');
+        });
+      },
+      logger,
+      repoCoord,
+      (reason) => resubscribeOnUnexpectedClose(reason, subscribeGlobalFeed),
+    );
+  subscribeGlobalFeed();
 
-  return { name, relay, store, links, bounties };
+  return {
+    name,
+    relay,
+    store,
+    links,
+    bounties,
+    stopWatchingConnection,
+    prepareForShutdown: () => {
+      isShuttingDown = true;
+    },
+  };
 }
 
 async function main() {
@@ -182,6 +221,8 @@ async function main() {
   const shutdown = () => {
     rootLogger.info('shutting down');
     for (const handle of handles) {
+      handle.stopWatchingConnection();
+      handle.prepareForShutdown();
       handle.relay.close();
       handle.store.close();
       handle.links.close();

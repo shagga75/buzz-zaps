@@ -28,7 +28,23 @@ export async function connectAndAuthenticate(
   logger: Logger,
   timeoutMs = 15_000,
 ): Promise<Relay> {
-  const relay = await Relay.connect(url);
+  // enableReconnect: nostr-tools' AbstractRelay already implements exactly
+  // what a post-startup drop needs — exponential backoff (capped at 60s,
+  // retried forever), and on reconnect it re-fires every subscription
+  // still open (subscribeToChannel/subscribeGlobal's, since we never
+  // .close() them until shutdown) with `since` bumped to each filter's
+  // last-received event, not a full history replay. It also re-runs NIP-42
+  // auth automatically: Buzz resends an unsolicited AUTH challenge on every
+  // new connection, and `relay.onauth` (set below) is still wired, so the
+  // same sign-and-respond flow fires again with no extra code. Writing this
+  // ourselves would just be reimplementing what the library already gives
+  // for free — confirmed by reading node_modules' abstract-relay.js before
+  // reaching for `enableReconnect`, not assumed from the type signature
+  // alone. A first-attempt connection failure (the case Fase 2's
+  // Promise.allSettled fail-soft startup logic depends on) still rejects
+  // normally — enableReconnect only kicks in after at least one successful
+  // connection.
+  const relay = await Relay.connect(url, { enableReconnect: true });
   logger.info({ url }, 'connected to buzz relay');
 
   const signAuthEvent = async (evt: EventTemplate): Promise<VerifiedEvent> => finalizeEvent(evt, secretKey);
@@ -41,12 +57,39 @@ export async function connectAndAuthenticate(
   return relay;
 }
 
+/**
+ * Logs connection drops and recoveries for a relay connected with
+ * `enableReconnect: true`. nostr-tools doesn't expose an onreconnect-style
+ * hook (checked abstract-relay.d.ts — `reconnectAttempts`/
+ * `reconnectTimeoutHandle` are private, only the `connected` getter is
+ * public), so this polls it. Purely observability — nostr-tools handles the
+ * actual reconnect regardless of whether anything is watching it.
+ *
+ * Returns a stop function; call it on shutdown so the interval doesn't keep
+ * the process alive.
+ */
+export function watchConnectionState(relay: Relay, logger: Logger, intervalMs = 5_000): () => void {
+  let wasConnected = relay.connected;
+  const interval = setInterval(() => {
+    const isConnected = relay.connected;
+    if (isConnected === wasConnected) return;
+    if (isConnected) {
+      logger.info({ url: relay.url }, 'relay connection restored');
+    } else {
+      logger.warn({ url: relay.url }, 'relay connection lost — nostr-tools will keep retrying with backoff');
+    }
+    wasConnected = isConnected;
+  }, intervalMs);
+  return () => clearInterval(interval);
+}
+
 export function subscribeToChannel(
   relay: Relay,
   channelId: string,
   kinds: number[],
   onEvent: (event: Event) => void,
   logger: Logger,
+  onClose?: (reason: string) => void,
 ) {
   const filter: Filter = { kinds, '#h': [channelId] };
   const sub = relay.subscribe([filter], {
@@ -62,6 +105,7 @@ export function subscribeToChannel(
     },
     onclose(reason) {
       logger.warn({ channelId, reason }, 'channel subscription closed');
+      onClose?.(reason);
     },
   });
   return sub;
@@ -74,7 +118,14 @@ export function subscribeToChannel(
  * in that list, so a PR merge notification never carries an `h` tag).
  * Optionally scoped to one repo via its `a`-tag coordinate.
  */
-export function subscribeGlobal(relay: Relay, kinds: number[], onEvent: (event: Event) => void, logger: Logger, repoCoord?: string) {
+export function subscribeGlobal(
+  relay: Relay,
+  kinds: number[],
+  onEvent: (event: Event) => void,
+  logger: Logger,
+  repoCoord?: string,
+  onClose?: (reason: string) => void,
+) {
   const filter: Filter = { kinds, ...(repoCoord ? { '#a': [repoCoord] } : {}) };
   const sub = relay.subscribe([filter], {
     onevent(event) {
@@ -89,6 +140,7 @@ export function subscribeGlobal(relay: Relay, kinds: number[], onEvent: (event: 
     },
     onclose(reason) {
       logger.warn({ kinds, reason }, 'global subscription closed');
+      onClose?.(reason);
     },
   });
   return sub;
