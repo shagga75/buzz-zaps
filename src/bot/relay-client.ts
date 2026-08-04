@@ -99,6 +99,45 @@ export async function publish(relay: Relay, event: Event, logger: Logger): Promi
   logger.info({ id: event.id, kind: event.kind }, 'published event');
 }
 
+// From crates/buzz-core/src/kind.rs in the buzz fork: replaceable, one per
+// author. Its mere existence for a pubkey is Buzz's own "this is an agent"
+// signal — no separate role/flag needed.
+const KIND_AGENT_PROFILE = 10100;
+
+/**
+ * One-shot lookup for whether `pubkey` has ever published a kind:10100
+ * (AGENT_PROFILE) event — used to tell an agent's reply apart from a human's
+ * when deciding who to charge for a completed task.
+ */
+export function hasAgentProfile(relay: Relay, pubkey: string, timeoutMs = 5_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      sub.close();
+      resolve(false);
+    }, timeoutMs);
+
+    const sub = relay.subscribe([{ kinds: [KIND_AGENT_PROFILE], authors: [pubkey], limit: 1 }], {
+      onevent() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        sub.close();
+        resolve(true);
+      },
+      oneose() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        sub.close();
+        resolve(false);
+      },
+    });
+  });
+}
+
 /**
  * One-shot lookup for a single event by id — used when a reaction targets a
  * message older than our in-memory author cache (e.g. posted before this

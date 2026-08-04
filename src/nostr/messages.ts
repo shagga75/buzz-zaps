@@ -12,6 +12,22 @@ export interface ReplyTarget {
    * bounty flow live, not by reading the code first.
    */
   threadEventId: string | null;
+  /**
+   * The NIP-10 thread root, only if it differs from `threadEventId` — i.e.
+   * `threadEventId` is itself a reply, not a root-level channel message.
+   * Omit when `threadEventId` *is* the root (every trigger before
+   * `agent_task_completed`): the relay treats a lone `reply`-marked `e` tag
+   * as "parent doubles as root" (same function in buzz-relay). Setting it
+   * equal to `threadEventId` there is harmless but redundant.
+   *
+   * Required when it diverges, or the relay rejects the reply with "root
+   * tag does not match thread ancestry" — confirmed live running the
+   * agent-task-completion trigger: it threads the bot's charge-request
+   * reply under the agent's own reply message, which is already one level
+   * deep (a reply to the human's request), so the shorthand's implicit
+   * "parent == root" no longer holds.
+   */
+  rootEventId?: string;
   /** Who gets @-mentioned (NIP-10 `p` tag) — the command sender, or whoever triggered the action. */
   mentionPubkey: string;
 }
@@ -23,6 +39,7 @@ export function buildChannelReply(
   content: string,
   secretKey: Uint8Array,
 ): VerifiedEvent {
+  const hasExplicitRoot = target.rootEventId !== undefined && target.rootEventId !== target.threadEventId;
   return finalizeEvent(
     {
       kind: 9,
@@ -30,7 +47,12 @@ export function buildChannelReply(
       content,
       tags: [
         ['h', channelId],
-        ...(target.threadEventId ? [['e', target.threadEventId, '', 'reply']] : []),
+        ...(target.threadEventId
+          ? [
+              ...(hasExplicitRoot ? [['e', target.rootEventId as string, '', 'root']] : []),
+              ['e', target.threadEventId, '', 'reply'],
+            ]
+          : []),
         ['p', target.mentionPubkey],
       ],
     },

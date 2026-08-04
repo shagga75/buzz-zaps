@@ -69,6 +69,15 @@ const triggerSchema = z.discriminatedUnion('on', [
     emoji: z.string(),
     amount_sats: z.number().int().positive(),
   }),
+  z.object({
+    on: z.literal('agent_task_completed'),
+    amount_sats: z.number().int().positive(),
+    // LaWallet username that receives the charge (buzz-zaps' own service
+    // address, not a per-user one) — kept in the trigger itself, not a new
+    // required env var, so communities that don't use this trigger don't
+    // need to configure a service wallet just to boot.
+    service_username: z.string().min(1),
+  }),
 ]);
 
 const triggersFileSchema = z.object({
