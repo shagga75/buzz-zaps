@@ -219,7 +219,8 @@ solo sabía hablar con una comunidad a la vez.
 **Cómo quedó armado**: `config/communities.yaml` reemplaza a `config/triggers.example.yaml` — ya no hay
 `BUZZ_CHANNEL_ID`/`LAWALLET_BASE_URL`/`TRIGGERS_CONFIG_PATH` en `.env` (ver "Variables de entorno"). Cada
 entrada de `communities:` es un `{ name, relay_url, channel_id, lawallet_base_url, triggers, ... }`
-independiente. `src/index.ts` arranca todas con `Promise.all`: cada una abre su propia conexión NIP-42 al
+independiente. `src/index.ts` arranca todas en paralelo (`Promise.allSettled` — ver "Próximos pasos" /
+resiliencia de arranque): cada una abre su propia conexión NIP-42 al
 relay, su propio `LaWalletClient`, sus propias `ZapStore`/`LinkStore`/`BountyStore` (SQLite en
 `${DB_DIR}/${name}.sqlite3` si no seteás `db_path`), y corre exactamente los mismos handlers que antes —
 nada compartido entre comunidades salvo la identidad Nostr del bot (`BUZZ_BOT_NSEC`), que sigue siendo una
@@ -467,6 +468,11 @@ scripts/
 - El fee (Fase 3) es honor-system: nada obliga a pagar el segundo invoice, ni se trackea si se pagó o no.
   Para hacerlo real habría que, como mínimo, pollear también el invoice de fee y loguear/alertar cuando no
   se paga — no bloquear el zap principal por eso, pero sí tener visibilidad.
-- Resiliencia de arranque multi-comunidad: hoy si una sola comunidad falla al conectar (relay caído, host
-  mal configurado), `Promise.all` tira abajo el proceso entero — ninguna comunidad queda online. Para un
-  despliegue con muchos clientes reales conviene que una comunidad rota no tumbe a las demás.
+- **Resiliencia de arranque solo cubre el momento de conectar, no después**: `src/index.ts` usa
+  `Promise.allSettled` — si una comunidad falla al arrancar (relay caído, host mal configurado), se loguea
+  el error y las demás siguen online (si todas fallan, el proceso sale con exit 1 en vez de quedar
+  colgado sirviendo nada). Decisión explícita: sin reintento automático — la comunidad rota queda afuera
+  hasta el próximo reinicio manual, mismo modelo que ya usa el resto del proyecto (arreglar config +
+  reiniciar). Lo que sigue sin resolver: si una comunidad se cae *después* de haber arrancado bien (el
+  relay se reinicia, la conexión se corta), no hay lógica de reconexión — la comunidad queda muda hasta
+  el próximo reinicio del proceso completo.
