@@ -8,7 +8,7 @@ import { LinkStore } from '../db/links.js';
 import { BountyStore } from '../db/bounties.js';
 import { buildChannelReply } from '../nostr/messages.js';
 import { parseBountyCommand } from './command-parser.js';
-import { fetchEventById, publish } from './relay-client.js';
+import { fetchChannelAdmins, fetchEventById, publish } from './relay-client.js';
 import { runZapFlow } from './zap-flow.js';
 
 // From crates/buzz-core/src/kind.rs in the buzz fork.
@@ -32,6 +32,19 @@ export async function handleBountyCommand(event: Event, deps: BountyFlowDeps): P
   if (!command) return;
 
   const { relay, config, botSecretKey, bounties, logger } = deps;
+
+  // Gated to the channel's own owner/admin members — the same people who
+  // could push/administer the repo directly in Buzz (git_perms.rs: "channel
+  // role = repo role"), not a community-wide role that might not even be a
+  // member here. Fails closed: a relay timeout means an empty admin set,
+  // which denies the command rather than letting an unverifiable request
+  // through.
+  const admins = await fetchChannelAdmins(relay, config.channelId);
+  if (!admins.has(event.pubkey)) {
+    logger.debug({ pubkey: event.pubkey, channelId: config.channelId }, '/bounty ignored — not an owner/admin of this channel');
+    return;
+  }
+
   bounties.register(command.targetEventId, command.amountSats, event.pubkey);
   logger.info({ targetEventId: command.targetEventId, amountSats: command.amountSats, createdBy: event.pubkey }, 'registered bounty');
 

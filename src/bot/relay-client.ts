@@ -171,3 +171,46 @@ export function fetchEventById(relay: Relay, id: string, timeoutMs = 5_000): Pro
     });
   });
 }
+
+// From crates/buzz-core/src/kind.rs in the buzz fork: NIP-29 kind:39001, an
+// addressable/replaceable event (`d` tag = channel id) the relay itself
+// publishes and keeps current. Its `p` tags are pre-filtered server-side to
+// just the channel's `owner`/`admin` members (crates/buzz-relay/src/
+// handlers/side_effects.rs — confirmed reading the emission code, not
+// assumed), so every `p` tag here already IS an admin or owner; there's no
+// separate role check needed client-side.
+const KIND_NIP29_GROUP_ADMINS = 39001;
+
+/**
+ * The set of pubkeys with `owner`/`admin` role in `channelId`, per Buzz's
+ * own git-repo permission model (crates/buzz-core/src/git_perms.rs:
+ * "channel role = repo role") — used to gate `/bounty` to the same people
+ * who could push/administer the repo directly in Buzz, not a
+ * community-wide role that might not even be a member of this channel.
+ */
+export function fetchChannelAdmins(relay: Relay, channelId: string, timeoutMs = 5_000): Promise<Set<string>> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let latest: Event | null = null;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      sub.close();
+      resolve(new Set());
+    }, timeoutMs);
+
+    const sub = relay.subscribe([{ kinds: [KIND_NIP29_GROUP_ADMINS], '#d': [channelId] }], {
+      onevent(event) {
+        if (!latest || event.created_at > latest.created_at) latest = event;
+      },
+      oneose() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        sub.close();
+        const pubkeys = latest?.tags.filter((tag) => tag[0] === 'p').map((tag) => tag[1]) ?? [];
+        resolve(new Set(pubkeys));
+      },
+    });
+  });
+}

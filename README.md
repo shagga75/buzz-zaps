@@ -152,6 +152,32 @@ figura como autor del PR, se rechaza el pago.
 **Idempotencia**: como el evento de merge no se repite, un `hasSourceEvent()` nuevo en `ZapStore` evita
 reprocesar el mismo merge si el relay lo reenvía (ej. tras una reconexión).
 
+**Control de acceso**: solo owners/admins del canal pueden correr `/bounty` — cualquier otro pubkey lo ve
+ignorado en silencio (mismo patrón que el resto de los guards del proyecto: se loguea en debug, no se
+spamea el canal con un rechazo). Antes de codear se investigó el modelo de roles real de Buzz, porque hay
+**dos sistemas distintos**:
+
+- Un rol de **comunidad entera** (`relay_members`, `"owner"`/`"admin"`/`"member"`, consultable vía
+  kind:13534 — NIP-43 membership list).
+- Un rol de **canal** (`channel_members`, enum `MemberRole`: `Owner`/`Admin`/`Member`/`Guest`/`Bot`,
+  consultable vía kind:39001, NIP-29 group admins).
+
+Se eligió el de **canal**, no el de comunidad: es el mismo que Buzz usa para gatear quién puede
+administrar el repo git asociado (`crates/buzz-core/src/git_perms.rs`, doc-comment explícito: *"channel
+role = repo role"*). Un admin de la comunidad entera podría ni ser miembro de este canal; el rol de canal
+es el que realmente controla el repo cuyo PR el bounty está prometiendo pagar.
+
+`fetchChannelAdmins` (`src/bot/relay-client.ts`) pide `{"kinds":[39001],"#d":["<channel_id>"]}` — el
+relay ya pre-filtra los tags `p` a solo owner/admin (confirmado leyendo el código de emisión en
+`buzz-relay`, no asumido), así que cualquier pubkey en esos tags ya califica, sin re-chequear el rol en
+el cliente. **Falla cerrado**: si la consulta al relay hace timeout, se resuelve un set vacío — nadie
+pasa el gate, en vez de dejar pasar un pedido que no se pudo verificar.
+
+Live-testeado con un canal real: el pubkey que crea un canal (`kind:9007`) se vuelve owner automático en
+Buzz, confirmado en la práctica — `/bounty` desde ese pubkey se registró; desde un pubkey random ajeno al
+canal quedó ignorado en silencio (verificado que ni siquiera pisó el registro existente vía el
+`ON CONFLICT` de `bounties.register()`).
+
 ## Fase 2 — cobro automático por tarea completada
 
 `agent_task_completed` (`config/communities.example.yaml`) cobra `amount_sats` a un usuario cuando un
@@ -417,7 +443,7 @@ eventos kind:9734/9735 — no reemplazan este flujo manual, que requiere las tre
 ```
 src/
   bot/
-    relay-client.ts          # conectar + auth NIP-42 + suscribir(canal)/suscribir(global)/publicar/fetchEventById
+    relay-client.ts          # conectar + auth NIP-42 + suscribir(canal)/suscribir(global)/publicar/fetchEventById/fetchChannelAdmins
     command-parser.ts        # detectar "/zap @user <monto>", "/link <username>", "/bounty <id> <monto>"
     zap-flow.ts               # runZapFlow compartido — invoice → fee opcional → reply → poll → receipt (devuelve el outcome)
     link-flow.ts               # handler de /link
@@ -456,9 +482,6 @@ scripts/
   la extensión del listener propio que se implementó acá — quedó autocontenido a propósito para no
   depender de administrar workflows del lado de Buzz, pero delegarlo reusaría infraestructura que Buzz
   ya tiene battle-tested.
-- `/bounty` sin control de acceso: hoy cualquiera en el canal puede prometer sats de la wallet de la
-  comunidad. Producción necesita gatear esto a admins/owners del repo — Buzz ya tiene roles (NIP-43,
-  `role=admin`), falta conectar esa verificación acá.
 - Reintento de bounties fallidos: si el pago timeoutea o falla, el bounty queda `open` pero no hay
   ningún evento que lo vuelva a disparar (el merge solo ocurre una vez). Falta un comando manual de
   reintento o un job periódico.
