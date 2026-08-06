@@ -6,7 +6,7 @@ import { connectAndAuthenticate, subscribeToChannel, subscribeGlobal, watchConne
 import { handleChannelMessage } from './bot/zap-flow.js';
 import { handleLinkCommand } from './bot/link-flow.js';
 import { handleReaction } from './bot/reaction-flow.js';
-import { handleBountyCommand, handleMergeStatus, KIND_GIT_STATUS_MERGED } from './bot/bounty-flow.js';
+import { handleBountyCommand, handleMergeStatus, handleRetryBountyCommand, KIND_GIT_STATUS_MERGED } from './bot/bounty-flow.js';
 import { handleAgentReply } from './bot/task-completion-flow.js';
 import { MessageAuthorCache } from './bot/message-author-cache.js';
 import { AgentPubkeyCache } from './bot/agent-cache.js';
@@ -125,6 +125,11 @@ async function startCommunity(
           void handleBountyCommand(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, feeStore, links, bounties, logger }).catch(
             (err) => {
               logger.error({ err, eventId: event.id }, 'unhandled error processing /bounty command');
+            },
+          );
+          void handleRetryBountyCommand(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, feeStore, links, bounties, logger }).catch(
+            (err) => {
+              logger.error({ err, eventId: event.id }, 'unhandled error processing /retry-bounty command');
             },
           );
           void handleAgentReply(event, {

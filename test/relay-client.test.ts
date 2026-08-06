@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Relay } from 'nostr-tools/relay';
-import { fetchChannelAdmins, subscribeGlobal, subscribeToChannel, watchConnectionState } from '../src/bot/relay-client.js';
+import { fetchChannelAdmins, hasMergeStatusEvent, subscribeGlobal, subscribeToChannel, watchConnectionState } from '../src/bot/relay-client.js';
 
 const noopLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: () => noopLogger } as any;
 
@@ -59,6 +59,41 @@ describe('fetchChannelAdmins', () => {
     const admins = await fetchChannelAdmins(relay, channelId, 20);
 
     expect(admins).toEqual(new Set());
+  });
+});
+
+describe('hasMergeStatusEvent', () => {
+  const targetEventId = 'pr'.padEnd(64, '1');
+
+  function fakeMergeRelay(hasEvent: boolean, { skipEose = false } = {}): Relay {
+    return {
+      subscribe: (filters: any[], handlers: any) => {
+        const filter = filters[0];
+        queueMicrotask(() => {
+          if (filter.kinds?.[0] === 1631 && filter['#e']?.[0] === targetEventId && hasEvent) {
+            handlers.onevent?.({ id: 'merge-1', kind: 1631, tags: [['e', targetEventId, '', 'root']] });
+          } else if (!skipEose) {
+            handlers.oneose?.();
+          }
+        });
+        return { close: vi.fn() };
+      },
+    } as unknown as Relay;
+  }
+
+  it('resolves true when a kind:1631 event references the target', async () => {
+    const relay = fakeMergeRelay(true);
+    expect(await hasMergeStatusEvent(relay, targetEventId)).toBe(true);
+  });
+
+  it('resolves false (fails closed) when nothing comes back before EOSE', async () => {
+    const relay = fakeMergeRelay(false);
+    expect(await hasMergeStatusEvent(relay, targetEventId)).toBe(false);
+  });
+
+  it('resolves false (fails closed) on timeout', async () => {
+    const relay = fakeMergeRelay(false, { skipEose: true });
+    expect(await hasMergeStatusEvent(relay, targetEventId, 20)).toBe(false);
   });
 });
 

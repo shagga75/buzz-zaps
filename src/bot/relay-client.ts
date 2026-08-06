@@ -266,3 +266,47 @@ export function fetchChannelAdmins(relay: Relay, channelId: string, timeoutMs = 
     });
   });
 }
+
+// 1631 = kind:1618/1619's "merged" status (buzz-core/src/kind.rs) — same
+// constant bounty-flow.ts exports as KIND_GIT_STATUS_MERGED. Hardcoded here
+// rather than imported to avoid a cycle (bounty-flow.ts already imports
+// from this module), matching how KIND_NIP29_GROUP_ADMINS above is scoped
+// to this file too.
+const KIND_GIT_STATUS_MERGED = 1631;
+
+/**
+ * Whether a kind:1631 "merged" status event exists for `targetEventId` —
+ * used by `/retry-bounty` to confirm a still-open bounty's PR actually did
+ * merge before re-requesting its payout, rather than trusting the command
+ * alone (which would let anyone who can post it bypass the whole
+ * "pays out on merge" model bounties are built on). Fails closed on
+ * timeout/no event, same as fetchChannelAdmins above.
+ */
+export function hasMergeStatusEvent(relay: Relay, targetEventId: string, timeoutMs = 5_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      sub.close();
+      resolve(false);
+    }, timeoutMs);
+
+    const sub = relay.subscribe([{ kinds: [KIND_GIT_STATUS_MERGED], '#e': [targetEventId] }], {
+      onevent(event) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        sub.close();
+        resolve(true);
+      },
+      oneose() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        sub.close();
+        resolve(false);
+      },
+    });
+  });
+}

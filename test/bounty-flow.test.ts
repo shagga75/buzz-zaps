@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { Relay } from 'nostr-tools/relay';
 import { generateSecretKey } from 'nostr-tools/pure';
-import { handleBountyCommand, handleMergeStatus, KIND_GIT_PULL_REQUEST, KIND_GIT_STATUS_MERGED } from '../src/bot/bounty-flow.js';
+import { handleBountyCommand, handleMergeStatus, handleRetryBountyCommand, KIND_GIT_PULL_REQUEST, KIND_GIT_STATUS_MERGED } from '../src/bot/bounty-flow.js';
 import { BountyStore } from '../src/db/bounties.js';
 import { LinkStore } from '../src/db/links.js';
 import { LaWalletError, type LaWalletClient } from '../src/lightning/lawallet-client.js';
@@ -9,9 +9,9 @@ import type { AppConfig } from '../src/config.js';
 
 vi.mock('../src/bot/relay-client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/bot/relay-client.js')>();
-  return { ...actual, fetchEventById: vi.fn() };
+  return { ...actual, fetchEventById: vi.fn(), hasMergeStatusEvent: vi.fn() };
 });
-import { fetchEventById } from '../src/bot/relay-client.js';
+import { fetchEventById, hasMergeStatusEvent } from '../src/bot/relay-client.js';
 
 const botSecretKey = generateSecretKey();
 const config = { channelId: 'chan-1', buzzRelayUrl: 'ws://localhost:3000', zapReceiptExtraRelays: [] } as unknown as AppConfig;
@@ -211,5 +211,171 @@ describe('handleBountyCommand', () => {
 
     expect(bounties.getOpen(validPrId)).toBeNull();
     expect(relay.publish).not.toHaveBeenCalled();
+  });
+});
+
+describe('handleRetryBountyCommand', () => {
+  const senderPubkey = 'sender'.padEnd(64, '5');
+  const validPrId = 'a'.repeat(64);
+
+  function retryCommandEvent(overrides: Partial<{ pubkey: string }> = {}) {
+    return {
+      id: 'retry-cmd-1',
+      pubkey: overrides.pubkey ?? senderPubkey,
+      content: `/retry-bounty ${validPrId}`,
+      tags: [['h', 'chan-1']],
+    } as any;
+  }
+
+  /** Fake relay whose kind:39001 (channel admins) lookup reports `adminPubkeys`. */
+  function fakeRelayWithAdmins(adminPubkeys: string[]): Relay {
+    return {
+      publish: vi.fn(async () => ''),
+      subscribe: (filters: any[], handlers: any) => {
+        const filter = filters[0];
+        queueMicrotask(() => {
+          if (filter.kinds?.[0] === 39001 && adminPubkeys.length > 0) {
+            handlers.onevent?.({ created_at: 1, tags: adminPubkeys.map((pk) => ['p', pk]) });
+          }
+          handlers.oneose?.();
+        });
+        return { close: vi.fn() };
+      },
+    } as unknown as Relay;
+  }
+
+  beforeEach(() => {
+    vi.mocked(fetchEventById).mockReset();
+    vi.mocked(hasMergeStatusEvent).mockReset();
+  });
+
+  it('ignores the command when the sender is not an owner/admin of the channel', async () => {
+    const relay = fakeRelayWithAdmins([]); // nobody is admin
+    const bounties = new BountyStore(':memory:');
+    bounties.register(validPrId, 5000, creatorPubkey);
+    const links = new LinkStore(':memory:');
+    const store = { hasSourceEvent: () => false, insertPending: vi.fn() } as any;
+
+    await handleRetryBountyCommand(retryCommandEvent(), {
+      relay,
+      config,
+      botSecretKey,
+      lawallet: {} as LaWalletClient,
+      store,
+      feeStore: {} as any,
+      links,
+      bounties,
+      logger: noopLogger,
+    });
+
+    expect(relay.publish).not.toHaveBeenCalled();
+    expect(hasMergeStatusEvent).not.toHaveBeenCalled();
+  });
+
+  it('replies that there is no open bounty when none is registered (already paid or never set)', async () => {
+    const relay = fakeRelayWithAdmins([senderPubkey]);
+    const bounties = new BountyStore(':memory:'); // nothing registered
+    const links = new LinkStore(':memory:');
+    const store = { hasSourceEvent: () => false, insertPending: vi.fn() } as any;
+
+    await handleRetryBountyCommand(retryCommandEvent(), {
+      relay,
+      config,
+      botSecretKey,
+      lawallet: {} as LaWalletClient,
+      store,
+      feeStore: {} as any,
+      links,
+      bounties,
+      logger: noopLogger,
+    });
+
+    expect(relay.publish).toHaveBeenCalledTimes(1);
+    const published = (relay.publish as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(published.content).toContain('No hay ningún bounty abierto');
+    expect(hasMergeStatusEvent).not.toHaveBeenCalled();
+  });
+
+  it('refuses to retry when the PR does not (yet) show a merged status', async () => {
+    const relay = fakeRelayWithAdmins([senderPubkey]);
+    const bounties = new BountyStore(':memory:');
+    bounties.register(validPrId, 5000, creatorPubkey);
+    const links = new LinkStore(':memory:');
+    const store = { hasSourceEvent: () => false, insertPending: vi.fn() } as any;
+    vi.mocked(hasMergeStatusEvent).mockResolvedValue(false);
+
+    await handleRetryBountyCommand(retryCommandEvent(), {
+      relay,
+      config,
+      botSecretKey,
+      lawallet: {} as LaWalletClient,
+      store,
+      feeStore: {} as any,
+      links,
+      bounties,
+      logger: noopLogger,
+    });
+
+    expect(hasMergeStatusEvent).toHaveBeenCalledWith(relay, validPrId);
+    expect(fetchEventById).not.toHaveBeenCalled();
+    const published = (relay.publish as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(published.content).toContain('todavía no aparece como mergeado');
+    expect(bounties.getOpen(validPrId)).not.toBeNull(); // still open
+  });
+
+  it('retries the payout when confirmed merged, and marks the bounty paid on success', async () => {
+    const relay = fakeRelayWithAdmins([senderPubkey]);
+    const bounties = new BountyStore(':memory:');
+    bounties.register(validPrId, 5000, creatorPubkey);
+    const links = new LinkStore(':memory:');
+    links.link(authorPubkey, 'satoshi');
+    const store = { hasSourceEvent: () => false, insertPending: vi.fn(() => 1), markPaid: vi.fn(), markExpired: vi.fn() } as any;
+    vi.mocked(hasMergeStatusEvent).mockResolvedValue(true);
+    vi.mocked(fetchEventById).mockResolvedValue({ id: validPrId, kind: KIND_GIT_PULL_REQUEST, pubkey: authorPubkey } as any);
+    const lawallet = {
+      requestInvoice: vi.fn().mockResolvedValue({ bolt11: 'lnbc1', verifyUrl: 'https://verify/1' }),
+      pollUntilSettled: vi.fn().mockResolvedValue({ settled: true, preimage: 'ff'.repeat(16) }),
+    } as unknown as LaWalletClient;
+
+    await handleRetryBountyCommand(retryCommandEvent(), {
+      relay,
+      config,
+      botSecretKey,
+      lawallet,
+      store,
+      feeStore: {} as any,
+      links,
+      bounties,
+      logger: noopLogger,
+    });
+
+    expect(lawallet.requestInvoice).toHaveBeenCalledWith('satoshi', 5000, expect.stringContaining(validPrId));
+    expect(bounties.getOpen(validPrId)).toBeNull(); // no longer open — retry paid it
+  });
+
+  it('leaves the bounty open when the retried payout fails again', async () => {
+    const relay = fakeRelayWithAdmins([senderPubkey]);
+    const bounties = new BountyStore(':memory:');
+    bounties.register(validPrId, 5000, creatorPubkey);
+    const links = new LinkStore(':memory:');
+    links.link(authorPubkey, 'satoshi');
+    const store = { hasSourceEvent: () => false, insertPending: vi.fn() } as any;
+    vi.mocked(hasMergeStatusEvent).mockResolvedValue(true);
+    vi.mocked(fetchEventById).mockResolvedValue({ id: validPrId, kind: KIND_GIT_PULL_REQUEST, pubkey: authorPubkey } as any);
+    const lawallet = { requestInvoice: vi.fn().mockRejectedValue(new LaWalletError('no route')) } as unknown as LaWalletClient;
+
+    await handleRetryBountyCommand(retryCommandEvent(), {
+      relay,
+      config,
+      botSecretKey,
+      lawallet,
+      store,
+      feeStore: {} as any,
+      links,
+      bounties,
+      logger: noopLogger,
+    });
+
+    expect(bounties.getOpen(validPrId)).not.toBeNull(); // still open — failed again
   });
 });
