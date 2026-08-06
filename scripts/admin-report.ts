@@ -3,6 +3,7 @@
 // to the box already has. Run: pnpm admin-report [--community <name>]
 import { loadGlobalConfig, loadCommunities, type Trigger } from '../src/config.js';
 import { ZapStore } from '../src/db/store.js';
+import { FeeStore } from '../src/db/fees.js';
 import { LinkStore } from '../src/db/links.js';
 import { BountyStore } from '../src/db/bounties.js';
 
@@ -45,12 +46,24 @@ function main() {
     console.log(`  fee: ${community.config.fee ? `${community.config.fee.bps}bps -> @${community.config.fee.serviceUsername}` : '(sin fee configurada)'}`);
 
     const store = new ZapStore(community.dbPath);
+    const feeStore = new FeeStore(community.dbPath);
     const links = new LinkStore(community.dbPath);
     const bounties = new BountyStore(community.dbPath);
 
     const zapSummary = store.summarizeStatus();
     console.log(`\n  zaps registrados:  pending:${zapSummary.pending}  paid:${zapSummary.paid}  expired:${zapSummary.expired}  failed:${zapSummary.failed}`);
     console.log('    (un fallo al pedir el invoice nunca llega a insertarse acá — solo queda en los logs)');
+
+    if (community.config.fee) {
+      const feeSummary = feeStore.summarize();
+      console.log(
+        `\n  fees cobrados:   pagados:${feeSummary.paid.count} (${feeSummary.paid.totalSats} sats)  pendientes:${feeSummary.pending.count} (${feeSummary.pending.totalSats} sats)  vencidos:${feeSummary.expired.count} (${feeSummary.expired.totalSats} sats)`,
+      );
+      const totalFees = feeSummary.paid.count + feeSummary.pending.count + feeSummary.expired.count;
+      if (totalFees > 0 && feeSummary.expired.count > 0) {
+        console.log(`    ⚠ ${feeSummary.expired.count} invoice(s) de fee no se pagaron a tiempo — sin cobrar, honor-system`);
+      }
+    }
 
     const bountySummary = bounties.summarize();
     console.log(`\n  bounties abiertos: ${bountySummary.open.count} (${bountySummary.open.totalSats} sats)`);
@@ -59,6 +72,7 @@ function main() {
     console.log(`\n  links registrados: ${links.count()}`);
 
     store.close();
+    feeStore.close();
     links.close();
     bounties.close();
   }

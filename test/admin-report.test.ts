@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ZapStore } from '../src/db/store.js';
+import { FeeStore } from '../src/db/fees.js';
 import { LinkStore } from '../src/db/links.js';
 import { BountyStore } from '../src/db/bounties.js';
 
@@ -63,5 +64,35 @@ describe('BountyStore.summarize', () => {
     const bounties = new BountyStore(':memory:');
     expect(bounties.summarize()).toEqual({ open: { count: 0, totalSats: 0 }, paid: { count: 0, totalSats: 0 } });
     bounties.close();
+  });
+});
+
+describe('FeeStore.summarize', () => {
+  it('splits count and total sats by status', () => {
+    const fees = new FeeStore(':memory:');
+    const paidId = fees.insertPending({ zapId: 1, serviceUsername: 'buzz-zaps-fees', amountSats: 2, bolt11: 'lnbc1', verifyUrl: 'https://verify/1' });
+    fees.markPaid(paidId);
+
+    const expiredId = fees.insertPending({ zapId: 2, serviceUsername: 'buzz-zaps-fees', amountSats: 4, bolt11: 'lnbc2', verifyUrl: 'https://verify/2' });
+    fees.markExpired(expiredId);
+
+    fees.insertPending({ zapId: 3, serviceUsername: 'buzz-zaps-fees', amountSats: 6, bolt11: 'lnbc3', verifyUrl: 'https://verify/3' }); // stays pending
+
+    expect(fees.summarize()).toEqual({
+      pending: { count: 1, totalSats: 6 },
+      paid: { count: 1, totalSats: 2 },
+      expired: { count: 1, totalSats: 4 },
+    });
+    fees.close();
+  });
+
+  it('returns zeroed summary when there are no fees', () => {
+    const fees = new FeeStore(':memory:');
+    expect(fees.summarize()).toEqual({
+      pending: { count: 0, totalSats: 0 },
+      paid: { count: 0, totalSats: 0 },
+      expired: { count: 0, totalSats: 0 },
+    });
+    fees.close();
   });
 });

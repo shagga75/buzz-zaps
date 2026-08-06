@@ -12,6 +12,7 @@ import { MessageAuthorCache } from './bot/message-author-cache.js';
 import { AgentPubkeyCache } from './bot/agent-cache.js';
 import { LaWalletClient } from './lightning/lawallet-client.js';
 import { ZapStore } from './db/store.js';
+import { FeeStore } from './db/fees.js';
 import { LinkStore } from './db/links.js';
 import { BountyStore } from './db/bounties.js';
 
@@ -26,6 +27,7 @@ export interface CommunityHandle {
   name: string;
   relay: Awaited<ReturnType<typeof connectAndAuthenticate>>;
   store: ZapStore;
+  feeStore: FeeStore;
   links: LinkStore;
   bounties: BountyStore;
   stopWatchingConnection: () => void;
@@ -75,6 +77,7 @@ async function startCommunity(
   logger: Logger,
 ): Promise<CommunityHandle> {
   const store = new ZapStore(dbPath);
+  const feeStore = new FeeStore(dbPath);
   const links = new LinkStore(dbPath);
   const bounties = new BountyStore(dbPath);
   const lawallet = new LaWalletClient(config.lawalletBaseUrl, logger);
@@ -113,15 +116,17 @@ async function startCommunity(
       (event) => {
         if (CHANNEL_MESSAGE_KINDS.includes(event.kind)) {
           authorCache.set(event.id, event.pubkey);
-          void handleChannelMessage(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, logger }).catch((err) => {
+          void handleChannelMessage(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, feeStore, logger }).catch((err) => {
             logger.error({ err, eventId: event.id }, 'unhandled error processing /zap command');
           });
           void handleLinkCommand(event, { relay, config, botSecretKey: bot.secretKey, links, logger }).catch((err) => {
             logger.error({ err, eventId: event.id }, 'unhandled error processing /link command');
           });
-          void handleBountyCommand(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, bounties, logger }).catch((err) => {
-            logger.error({ err, eventId: event.id }, 'unhandled error processing /bounty command');
-          });
+          void handleBountyCommand(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, feeStore, links, bounties, logger }).catch(
+            (err) => {
+              logger.error({ err, eventId: event.id }, 'unhandled error processing /bounty command');
+            },
+          );
           void handleAgentReply(event, {
             relay,
             config,
@@ -129,6 +134,7 @@ async function startCommunity(
             botSecretKey: bot.secretKey,
             lawallet,
             store,
+            feeStore,
             logger,
             authorCache,
             agentCache,
@@ -139,7 +145,7 @@ async function startCommunity(
           return;
         }
         if (event.kind === REACTION_KIND) {
-          void handleReaction(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, logger, authorCache, triggers }).catch(
+          void handleReaction(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, feeStore, links, logger, authorCache, triggers }).catch(
             (err) => {
               logger.error({ err, eventId: event.id }, 'unhandled error processing reaction');
             },
@@ -161,9 +167,11 @@ async function startCommunity(
       relay,
       [KIND_GIT_STATUS_MERGED],
       (event) => {
-        void handleMergeStatus(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, links, bounties, logger }).catch((err) => {
-          logger.error({ err, eventId: event.id }, 'unhandled error processing merge status');
-        });
+        void handleMergeStatus(event, { relay, config, botSecretKey: bot.secretKey, lawallet, store, feeStore, links, bounties, logger }).catch(
+          (err) => {
+            logger.error({ err, eventId: event.id }, 'unhandled error processing merge status');
+          },
+        );
       },
       logger,
       repoCoord,
@@ -175,6 +183,7 @@ async function startCommunity(
     name,
     relay,
     store,
+    feeStore,
     links,
     bounties,
     stopWatchingConnection,
@@ -225,6 +234,7 @@ async function main() {
       handle.prepareForShutdown();
       handle.relay.close();
       handle.store.close();
+      handle.feeStore.close();
       handle.links.close();
       handle.bounties.close();
     }

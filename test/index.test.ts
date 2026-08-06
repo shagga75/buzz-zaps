@@ -8,6 +8,7 @@ function fakeHandle(name: string): CommunityHandle {
     name,
     relay: {} as any,
     store: {} as any,
+    feeStore: {} as any,
     links: {} as any,
     bounties: {} as any,
     stopWatchingConnection: vi.fn(),

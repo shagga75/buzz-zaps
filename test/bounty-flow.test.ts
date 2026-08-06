@@ -47,6 +47,7 @@ describe('handleMergeStatus', () => {
       botSecretKey,
       lawallet: {} as LaWalletClient,
       store,
+      feeStore: {} as any,
       links,
       bounties,
       logger: noopLogger,
@@ -71,6 +72,7 @@ describe('handleMergeStatus', () => {
       botSecretKey,
       lawallet: {} as LaWalletClient,
       store,
+      feeStore: {} as any,
       links,
       bounties,
       logger: noopLogger,
@@ -94,6 +96,7 @@ describe('handleMergeStatus', () => {
       botSecretKey,
       lawallet: {} as LaWalletClient,
       store,
+      feeStore: {} as any,
       links,
       bounties,
       logger: noopLogger,
@@ -116,6 +119,7 @@ describe('handleMergeStatus', () => {
       botSecretKey,
       lawallet: {} as LaWalletClient,
       store,
+      feeStore: {} as any,
       links,
       bounties,
       logger: noopLogger,
@@ -131,7 +135,7 @@ describe('handleMergeStatus', () => {
     const getOpenSpy = vi.spyOn(bounties, 'getOpen');
     const links = new LinkStore(':memory:');
 
-    await handleMergeStatus(mergeEvent(), { relay, config, botSecretKey, lawallet: {} as LaWalletClient, store, links, bounties, logger: noopLogger });
+    await handleMergeStatus(mergeEvent(), { relay, config, botSecretKey, lawallet: {} as LaWalletClient, store, feeStore: {} as any, links, bounties, logger: noopLogger });
 
     expect(getOpenSpy).not.toHaveBeenCalled();
     expect(fetchEventById).not.toHaveBeenCalled();
@@ -147,7 +151,7 @@ describe('handleMergeStatus', () => {
     vi.mocked(fetchEventById).mockResolvedValue({ id: prId, kind: KIND_GIT_PULL_REQUEST, pubkey: authorPubkey } as any);
     const lawallet = { requestInvoice: vi.fn().mockRejectedValue(new LaWalletError('no route')) } as unknown as LaWalletClient;
 
-    await handleMergeStatus(mergeEvent(), { relay, config, botSecretKey, lawallet, store, links, bounties, logger: noopLogger });
+    await handleMergeStatus(mergeEvent(), { relay, config, botSecretKey, lawallet, store, feeStore: {} as any, links, bounties, logger: noopLogger });
 
     expect(lawallet.requestInvoice).toHaveBeenCalledWith('satoshi', 5000, expect.stringContaining(prId));
     expect(relay.publish).toHaveBeenCalledTimes(1);
@@ -191,7 +195,7 @@ describe('handleBountyCommand', () => {
     const bounties = new BountyStore(':memory:');
     const links = new LinkStore(':memory:');
 
-    await handleBountyCommand(bountyCommandEvent(), { relay, config, botSecretKey, lawallet: {} as LaWalletClient, store, links, bounties, logger: noopLogger });
+    await handleBountyCommand(bountyCommandEvent(), { relay, config, botSecretKey, lawallet: {} as LaWalletClient, store, feeStore: {} as any, links, bounties, logger: noopLogger });
 
     expect(bounties.getOpen(validPrId)).not.toBeNull();
     expect(relay.publish).toHaveBeenCalledTimes(1);
@@ -203,7 +207,7 @@ describe('handleBountyCommand', () => {
     const bounties = new BountyStore(':memory:');
     const links = new LinkStore(':memory:');
 
-    await handleBountyCommand(bountyCommandEvent(), { relay, config, botSecretKey, lawallet: {} as LaWalletClient, store, links, bounties, logger: noopLogger });
+    await handleBountyCommand(bountyCommandEvent(), { relay, config, botSecretKey, lawallet: {} as LaWalletClient, store, feeStore: {} as any, links, bounties, logger: noopLogger });
 
     expect(bounties.getOpen(validPrId)).toBeNull();
     expect(relay.publish).not.toHaveBeenCalled();

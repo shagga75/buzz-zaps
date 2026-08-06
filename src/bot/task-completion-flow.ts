@@ -4,6 +4,7 @@ import type { Logger } from '../logger.js';
 import type { AppConfig, TriggersFile } from '../config.js';
 import { LaWalletClient } from '../lightning/lawallet-client.js';
 import { ZapStore } from '../db/store.js';
+import { FeeStore } from '../db/fees.js';
 import { MessageAuthorCache } from './message-author-cache.js';
 import { AgentPubkeyCache } from './agent-cache.js';
 import { fetchEventById, hasAgentProfile } from './relay-client.js';
@@ -16,6 +17,7 @@ export interface TaskCompletionFlowDeps {
   botSecretKey: Uint8Array;
   lawallet: LaWalletClient;
   store: ZapStore;
+  feeStore: FeeStore;
   logger: Logger;
   authorCache: MessageAuthorCache;
   agentCache: AgentPubkeyCache;
@@ -101,6 +103,6 @@ export async function handleAgentReply(event: Event, deps: TaskCompletionFlowDep
       amountSats: rule.amount_sats,
       comment: `agent task completion charge from Buzz channel ${config.channelId}`,
     },
-    { relay, config, botSecretKey: deps.botSecretKey, lawallet: deps.lawallet, store, logger },
+    { relay, config, botSecretKey: deps.botSecretKey, lawallet: deps.lawallet, store, feeStore: deps.feeStore, logger },
   );
 }
