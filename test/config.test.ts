@@ -18,6 +18,14 @@ describe('loadGlobalConfig', () => {
     expect(config.communitiesConfigPath).toBe('./config/communities.example.yaml');
     expect(config.verifyPollIntervalMs).toBe(2000);
     expect(config.zapReceiptExtraRelays).toEqual(['wss://relay-a.example', 'wss://relay-b.example']);
+    expect(config.adminServerPort).toBe(8090);
+    expect(config.adminServerToken).toBeUndefined();
+  });
+
+  it('passes through ADMIN_SERVER_PORT/ADMIN_SERVER_TOKEN when set', () => {
+    const config = loadGlobalConfig({ ...baseEnv, ADMIN_SERVER_PORT: '9999', ADMIN_SERVER_TOKEN: 'secret-token' });
+    expect(config.adminServerPort).toBe(9999);
+    expect(config.adminServerToken).toBe('secret-token');
   });
 
   it('rejects a nsec that is not a valid nsec1 string', () => {

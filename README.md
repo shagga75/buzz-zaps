@@ -28,8 +28,9 @@ descuento del pago principal (ver "Fase 3 — fee middleware" para el porqué).
 
 Dashboard de administración (Fase 3, implementada): `pnpm admin-report` — reporte de solo lectura por
 comunidad (triggers, fee, zaps por estado, bounties, links registrados), corrido local contra las SQLite
-y `communities.yaml` — sin puerto HTTP ni modelo de auth nuevo (ver "Fase 3 — dashboard de administración"
-para el porqué).
+y `communities.yaml`. `pnpm admin-server` expone el mismo reporte como JSON por HTTP, gateado por un token
+compartido (`ADMIN_SERVER_TOKEN`) — ver "Fase 3 — dashboard de administración remoto" para el porqué del
+token en vez de NIP-98.
 
 ## Por qué está construido así (hallazgos antes de codear)
 
@@ -349,18 +350,55 @@ cobrados/pendientes/vencidos (con sats totales, solo si la comunidad tiene fee c
 abiertos/pagados (con sats totales), y cantidad de `/link` registrados. Lee directo las SQLite de cada
 comunidad y `communities.yaml` — no escribe nada.
 
-**Por qué CLI y no una UI web**: "dashboard" tiene lecturas muy distintas en riesgo — antes de codear se
-decidió explícitamente no exponer un puerto HTTP nuevo. `buzz-zaps` hoy no tiene ninguna superficie de
-entrada además del bot saliente (WebSocket hacia Buzz, HTTP hacia LaWallet); un servidor HTTP nuevo
-implica resolver auth desde cero (¿shared secret? ¿solo localhost?) para un proyecto que hoy corre una
-sola comunidad de prueba. Un reporte de solo lectura contra el filesystem local tiene el mismo nivel de
-riesgo que ya existe (acceso al server) — cero superficie nueva. Para cambiar algo seguís editando
-`communities.yaml` y reiniciando, como antes; esto es visibilidad, no un panel de control.
+**Por qué CLI primero**: cuando esto se implementó, `buzz-zaps` no tenía ninguna superficie de entrada más
+allá del bot saliente (WebSocket hacia Buzz, HTTP hacia LaWallet), y exponer un puerto HTTP nuevo implica
+resolver auth desde cero — se decidió explícitamente empezar por un reporte de solo lectura contra el
+filesystem local (mismo nivel de riesgo que ya existe: acceso al server), y dejar el acceso remoto para
+después. Ver "dashboard de administración remoto" más abajo para esa segunda vuelta.
 
 **Gap conocido**: los conteos de zaps salen de la tabla `zaps`, pero un fallo al *pedir* el invoice
 (`invoice_failed`) nunca llega a insertar una fila ahí — `insertPending` solo corre después de que el
 pedido tuvo éxito. Ese fallo hoy solo queda en los logs. El reporte lo dice explícitamente en vez de
 mostrar un número que parezca completo y no lo sea.
+
+## Fase 3 — dashboard de administración remoto
+
+```bash
+ADMIN_SERVER_TOKEN=un-secreto-largo pnpm admin-server
+curl -H "Authorization: Bearer un-secreto-largo" http://localhost:8090/report
+curl -H "Authorization: Bearer un-secreto-largo" "http://localhost:8090/report?community=<name>"
+```
+
+Mismo dato que `pnpm admin-report` (`src/admin/build-report.ts`, compartido entre los dos — nunca se
+duplicó la lógica de agregación), servido como JSON en vez de texto para terminal, para un operador que no
+tiene shell/acceso al filesystem del servidor.
+
+**Por qué token compartido y no NIP-98**: es el primer endpoint HTTP *entrante* que tiene `buzz-zaps` —
+antes de codear se pesó firmar requests con una clave Nostr (NIP-98, consistente con cómo el resto del
+proyecto identifica actores) contra un secreto compartido simple. Se eligió el secreto: cero dependencias
+nuevas, mismo nivel de confianza que ya tenía el reporte CLI (quien tiene el secreto ve lo mismo que quien
+tenía acceso al filesystem), y no le exige al operador manejar una clave Nostr solo para consultar un
+reporte de lectura. `ADMIN_SERVER_TOKEN` sin setear hace que `admin-server.ts` **se niegue a arrancar** en
+vez de levantar un endpoint sin auth por accidente.
+
+**Por qué proceso aparte y no un puerto más en `index.ts`**: mismo motivo que separó el reporte CLI del bot
+desde el principio — un bug en la capa HTTP no puede tumbar el bot que sí mueve sats en tiempo real.
+`scripts/admin-server.ts` abre sus propias conexiones SQLite (modo WAL, igual que cada store) contra los
+mismos archivos que el bot ya tiene abiertos; correr los dos en simultáneo ya está probado — es
+exactamente lo que pasa cada vez que se corrió `pnpm admin-report` con el bot corriendo.
+
+Comparación de tokens en tiempo constante (`timingSafeEqual`, `src/admin/server.ts`): un `===` común filtra
+cuántos bytes iniciales coincidieron a través del tiempo de respuesta, dejando adivinar el token byte por
+byte. Un solo endpoint (`GET /report[?community=<name>]`), a propósito — cualquier otro método o path
+devuelve 404/405 antes de tocar el filesystem.
+
+**Sin TLS**: es HTTP plano — si este puerto va a ser alcanzable fuera de una red de confianza, va detrás de
+un reverse proxy (nginx/caddy) que termine TLS, misma expectativa que cualquier API con bearer token sin
+implementación propia de HTTPS.
+
+**Gap conocido**: `communities.yaml` se carga una sola vez al arrancar `admin-server` — un cambio ahí
+requiere reiniciar el proceso para reflejarse, mismo modelo "arreglá config + reiniciá" que ya usa el resto
+del proyecto (ver "Resiliencia de arranque").
 
 ## Reconexión post-arranque
 
@@ -536,14 +574,19 @@ src/
     zap-receipt.ts        # construcción kind:9734 / kind:9735
   db/
     store.ts              # SQLite — auditoría de zaps (pending/paid/expired/failed) + hasSourceEvent (idempotencia)
+    fees.ts                 # SQLite — tracking del segundo invoice de fee (pending/paid/expired), ver "Fase 3 — fee middleware"
     links.ts               # SQLite — pubkey -> username de LaWallet (self-registrado con /link)
     bounties.ts             # SQLite — bounties abiertos/pagados por PR (soft escrow, ver /bounty)
+  admin/
+    build-report.ts          # agregación compartida por admin-report.ts (texto) y admin-server.ts (JSON)
+    server.ts                  # handleAdminRequest: auth + ruteo puro, testeable sin levantar un socket real
   config.ts               # GlobalConfig (.env) + loadCommunities (config/communities.yaml)
   index.ts                 # arranca N comunidades en paralelo — ver "Fase 2 — wallets por comunidad"
 config/
   communities.example.yaml   # una entrada por comunidad: relay, canal, wallet LaWallet y triggers
 scripts/
-  admin-report.ts             # reporte de solo lectura por comunidad, ver "Fase 3 — dashboard de administración"
+  admin-report.ts             # reporte de solo lectura por comunidad (texto), ver "Fase 3 — dashboard de administración"
+  admin-server.ts              # el mismo reporte por HTTP con token, ver "Fase 3 — dashboard de administración remoto"
   generate-key.ts              # genera un BUZZ_BOT_NSEC nuevo
 ```
 
@@ -561,9 +604,10 @@ scripts/
 - ~~Reintento de bounties fallidos~~ — resuelto: `/retry-bounty <event-id>` (ver "Fase 2 — bounty por PR
   mergeado"). Sigue sin haber un job periódico automático — es un comando manual, a propósito (menor
   alcance, no agrega un poller nuevo corriendo indefinidamente).
-- `pnpm admin-report` es de solo lectura y local (correr en la misma máquina/acceso al filesystem). Si
-  algún día hace falta consultarlo remoto (ej. un dashboard real para un operador que no tiene shell en el
-  server), ahí sí hace falta resolver el fork de auth/HTTP que se evitó a propósito acá.
+- ~~`pnpm admin-report` es solo local~~ — resuelto: `pnpm admin-server` expone el mismo reporte por HTTP con
+  token compartido (ver "Fase 3 — dashboard de administración remoto"). Queda sin resolver: no hay TLS
+  propio (va detrás de un reverse proxy si se expone fuera de una red de confianza), y `communities.yaml`
+  se lee una sola vez al arrancar el server.
 - El fee (Fase 3) sigue siendo honor-system a propósito (nada obliga a pagar el segundo invoice), pero
   desde ahora sí se trackea: se pollea su propio `verify_url` en background y queda registrado
   paid/pending/expired en `FeeStore`, visible vía `pnpm admin-report` y en los logs (`fee invoice was not
