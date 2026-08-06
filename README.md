@@ -287,9 +287,19 @@ publicado ("no custodiamos fondos"), no es un detalle de implementación.
 **Cómo quedó**: `runZapFlow` (el mismo flujo que usan los cuatro triggers) pide, además del invoice
 normal, un segundo invoice independiente por `floor(amount_sats * fee_bps / 10000)` sats a
 `fee_service_username` (misma dirección propia de `buzz-zaps` que usa `agent_task_completed`), y lo
-publica como una segunda respuesta en el canal. Es honor-system a propósito, igual que el cobro por tarea
-completada: nadie lo obliga a pagarse, `buzz-zaps` no lo trackea ni lo bloquea, y el zap receipt (kind
-9735) sigue dependiendo únicamente de que se pague el invoice principal.
+publica como una segunda respuesta en el canal. Sigue siendo honor-system a propósito, igual que el cobro
+por tarea completada: nadie está obligado a pagarlo, y el zap receipt (kind 9735) sigue dependiendo
+únicamente de que se pague el invoice principal — el fee nunca bloquea ni retrasa eso.
+
+**Tracking (antes no existía, ahora sí)**: `FeeStore` (`src/db/fees.ts`) registra cada invoice de fee en su
+propia tabla (`zap_id`, `service_username`, `amount_sats`, `bolt11`, `verify_url`, `status`), separada de
+`zaps` porque su ciclo de vida es independiente. Apenas se pide el invoice, `chargeFeeIfConfigured`
+dispara — sin esperarlo (`void`, fire-and-forget) — el mismo `pollUntilSettled` que ya usa el zap
+principal, contra el `verify_url` propio del fee. Si settlea, `markPaid`; si vence el timeout,
+`markExpired` + un `log.warn` explícito ("fee invoice was not paid before timeout"). Ninguno de los dos
+casos toca el resultado del zap principal — ya terminó su propio flujo para cuando esto resuelve. Visible
+después vía `pnpm admin-report` (conteo y sats por estado: pagados/pendientes/vencidos) o grepeando los
+logs.
 
 Guardas en `chargeFeeIfConfigured` (`src/bot/zap-flow.ts`):
 - **No hay fee sobre un fee**: si el trigger ya le está pagando a la wallet de fees (es lo que hace
@@ -308,9 +318,10 @@ pnpm admin-report                        # todas las comunidades
 pnpm admin-report -- --community <name>  # una sola
 ```
 
-Reporte de solo lectura por comunidad: triggers activos, fee configurada, conteo de zaps por estado,
-bounties abiertos/pagados (con sats totales), y cantidad de `/link` registrados. Lee directo las SQLite de
-cada comunidad y `communities.yaml` — no escribe nada.
+Reporte de solo lectura por comunidad: triggers activos, fee configurada, conteo de zaps por estado, fees
+cobrados/pendientes/vencidos (con sats totales, solo si la comunidad tiene fee configurada), bounties
+abiertos/pagados (con sats totales), y cantidad de `/link` registrados. Lee directo las SQLite de cada
+comunidad y `communities.yaml` — no escribe nada.
 
 **Por qué CLI y no una UI web**: "dashboard" tiene lecturas muy distintas en riesgo — antes de codear se
 decidió explícitamente no exponer un puerto HTTP nuevo. `buzz-zaps` hoy no tiene ninguna superficie de
@@ -524,9 +535,10 @@ scripts/
 - `pnpm admin-report` es de solo lectura y local (correr en la misma máquina/acceso al filesystem). Si
   algún día hace falta consultarlo remoto (ej. un dashboard real para un operador que no tiene shell en el
   server), ahí sí hace falta resolver el fork de auth/HTTP que se evitó a propósito acá.
-- El fee (Fase 3) es honor-system: nada obliga a pagar el segundo invoice, ni se trackea si se pagó o no.
-  Para hacerlo real habría que, como mínimo, pollear también el invoice de fee y loguear/alertar cuando no
-  se paga — no bloquear el zap principal por eso, pero sí tener visibilidad.
+- El fee (Fase 3) sigue siendo honor-system a propósito (nada obliga a pagar el segundo invoice), pero
+  desde ahora sí se trackea: se pollea su propio `verify_url` en background y queda registrado
+  paid/pending/expired en `FeeStore`, visible vía `pnpm admin-report` y en los logs (`fee invoice was not
+  paid before timeout`). Sigue sin bloquear el zap principal — eso fue una decisión explícita, no un gap.
 - **Resiliencia de arranque**: `src/index.ts` usa `Promise.allSettled` — si una comunidad falla al
   arrancar (relay caído, host mal configurado), se loguea el error y las demás siguen online (si todas
   fallan, el proceso sale con exit 1). Decisión explícita: sin reintento automático — la comunidad rota

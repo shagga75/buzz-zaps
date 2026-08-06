@@ -4,6 +4,7 @@ import type { Logger } from '../logger.js';
 import type { AppConfig } from '../config.js';
 import { LaWalletClient } from '../lightning/lawallet-client.js';
 import { ZapStore } from '../db/store.js';
+import { FeeStore } from '../db/fees.js';
 import { LinkStore } from '../db/links.js';
 import { BountyStore } from '../db/bounties.js';
 import { buildChannelReply } from '../nostr/messages.js';
@@ -21,6 +22,7 @@ export interface BountyFlowDeps {
   botSecretKey: Uint8Array;
   lawallet: LaWalletClient;
   store: ZapStore;
+  feeStore: FeeStore;
   links: LinkStore;
   bounties: BountyStore;
   logger: Logger;
@@ -112,7 +114,7 @@ export async function handleMergeStatus(event: Event, deps: BountyFlowDeps): Pro
       amountSats: bounty.amountSats,
       comment: `bounty payout for merged PR ${targetEventId}`,
     },
-    { relay, config, botSecretKey: deps.botSecretKey, lawallet, store, logger },
+    { relay, config, botSecretKey: deps.botSecretKey, lawallet, store, feeStore: deps.feeStore, logger },
   );
   // Only clear the bounty on an actual payout — a failed/expired attempt
   // leaves it 'open' so a future manual retry (re-running /bounty, or a

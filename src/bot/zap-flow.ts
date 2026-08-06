@@ -4,6 +4,7 @@ import type { Logger } from '../logger.js';
 import type { AppConfig } from '../config.js';
 import { LaWalletClient, LaWalletError } from '../lightning/lawallet-client.js';
 import { ZapStore } from '../db/store.js';
+import { FeeStore } from '../db/fees.js';
 import { buildChannelReply } from '../nostr/messages.js';
 import { buildSyntheticZapRequest, buildZapReceipt } from '../nostr/zap-receipt.js';
 import { parseZapCommand } from './command-parser.js';
@@ -15,6 +16,7 @@ export interface ZapFlowDeps {
   botSecretKey: Uint8Array;
   lawallet: LaWalletClient;
   store: ZapStore;
+  feeStore: FeeStore;
   logger: Logger;
 }
 
@@ -58,28 +60,68 @@ export type ZapOutcome = 'paid' | 'expired' | 'invoice_failed';
  *
  * Best-effort and non-blocking on purpose: a fee invoice failing (LaWallet
  * flakiness, misconfigured username) must never affect the main zap, which
- * is the thing users actually asked buzz-zaps to do. Nothing polls whether
- * the fee gets paid — it's the same honor-system pattern as
- * agent_task_completed's charge, not an enforced deduction.
+ * is the thing users actually asked buzz-zaps to do. Still honor-system —
+ * nothing here blocks or delays the main zap on the fee's outcome — but its
+ * settlement is now tracked: watched in the background (fire-and-forget,
+ * same non-blocking contract) and recorded in FeeStore so admin-report and
+ * the logs show whether it actually got paid instead of assuming it did.
  */
-async function chargeFeeIfConfigured(req: ZapRequest, deps: ZapFlowDeps, reply: (content: string) => Promise<void>, log: Logger): Promise<void> {
-  const { config, lawallet } = deps;
-  if (!config.fee) return;
-  if (req.targetUsername === config.fee.serviceUsername) return; // already paying the fee wallet itself — no fee on a fee
+async function chargeFeeIfConfigured(
+  zapId: number,
+  req: ZapRequest,
+  deps: ZapFlowDeps,
+  reply: (content: string) => Promise<void>,
+  log: Logger,
+): Promise<void> {
+  const { config, lawallet, feeStore } = deps;
+  const fee = config.fee;
+  if (!fee) return;
+  if (req.targetUsername === fee.serviceUsername) return; // already paying the fee wallet itself — no fee on a fee
 
-  const feeSats = Math.floor((req.amountSats * config.fee.bps) / 10_000);
+  const feeSats = Math.floor((req.amountSats * fee.bps) / 10_000);
   if (feeSats < 1) return; // rounds to 0 for small zaps — not worth a second invoice
 
+  let feeInvoice;
   try {
-    const feeInvoice = await lawallet.requestInvoice(
-      config.fee.serviceUsername,
+    feeInvoice = await lawallet.requestInvoice(
+      fee.serviceUsername,
       feeSats,
-      `buzz-zaps fee (${config.fee.bps / 100}%) on a ${req.amountSats}-sat zap to @${req.targetUsername}`,
+      `buzz-zaps fee (${fee.bps / 100}%) on a ${req.amountSats}-sat zap to @${req.targetUsername}`,
     );
-    await reply(`💰 Fee (${config.fee.bps / 100}%): invoice for ${feeSats} sats to @${config.fee.serviceUsername}:\n\n${feeInvoice.bolt11}`);
   } catch (err) {
     log.warn({ err, feeSats }, 'fee invoice request failed — continuing without it, the main zap is unaffected');
+    return;
   }
+
+  await reply(`💰 Fee (${fee.bps / 100}%): invoice for ${feeSats} sats to @${fee.serviceUsername}:\n\n${feeInvoice.bolt11}`);
+
+  const feeRowId = feeStore.insertPending({
+    zapId,
+    serviceUsername: fee.serviceUsername,
+    amountSats: feeSats,
+    bolt11: feeInvoice.bolt11,
+    verifyUrl: feeInvoice.verifyUrl,
+  });
+
+  // Deliberately not awaited: the fee's own settlement can take as long as
+  // the main zap's (up to verifyTimeoutMs) and must not delay this function
+  // returning, which is what lets runZapFlow move on to polling the main
+  // invoice right after this. A failure here — including the poll itself
+  // erroring — only ever logs; it can't affect the zap.
+  void (async () => {
+    try {
+      const settlement = await lawallet.pollUntilSettled(feeInvoice.verifyUrl, config.verifyPollIntervalMs, config.verifyTimeoutMs);
+      if (settlement.settled) {
+        feeStore.markPaid(feeRowId);
+        log.info({ feeRowId, feeSats }, 'fee invoice settled');
+      } else {
+        feeStore.markExpired(feeRowId);
+        log.warn({ feeRowId, feeSats, serviceUsername: fee.serviceUsername }, 'fee invoice was not paid before timeout — fee went uncollected for this zap');
+      }
+    } catch (err) {
+      log.warn({ err, feeRowId }, 'error polling fee invoice settlement');
+    }
+  })();
 }
 
 export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<ZapOutcome> {
@@ -121,7 +163,7 @@ export async function runZapFlow(req: ZapRequest, deps: ZapFlowDeps): Promise<Za
 
   await reply(`⚡ Invoice for ${req.amountSats} sats to @${req.targetUsername}:\n\n${invoice.bolt11}`);
 
-  await chargeFeeIfConfigured(req, deps, reply, log);
+  await chargeFeeIfConfigured(rowId, req, deps, reply, log);
 
   const zapRequest = buildSyntheticZapRequest(
     {

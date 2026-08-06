@@ -4,6 +4,7 @@ import type { Logger } from '../logger.js';
 import type { AppConfig, TriggersFile } from '../config.js';
 import { LaWalletClient } from '../lightning/lawallet-client.js';
 import { ZapStore } from '../db/store.js';
+import { FeeStore } from '../db/fees.js';
 import { LinkStore } from '../db/links.js';
 import { MessageAuthorCache } from './message-author-cache.js';
 import { fetchEventById } from './relay-client.js';
@@ -15,6 +16,7 @@ export interface ReactionFlowDeps {
   botSecretKey: Uint8Array;
   lawallet: LaWalletClient;
   store: ZapStore;
+  feeStore: FeeStore;
   links: LinkStore;
   logger: Logger;
   authorCache: MessageAuthorCache;
@@ -79,6 +81,6 @@ export async function handleReaction(event: Event, deps: ReactionFlowDeps): Prom
       amountSats: rule.amount_sats,
       comment: `${event.content} reaction zap from Buzz channel ${config.channelId}`,
     },
-    { relay, config, botSecretKey: deps.botSecretKey, lawallet, store, logger },
+    { relay, config, botSecretKey: deps.botSecretKey, lawallet, store, feeStore: deps.feeStore, logger },
   );
 }
