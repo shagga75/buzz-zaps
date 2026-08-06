@@ -1,6 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Relay } from 'nostr-tools/relay';
-import { fetchChannelAdmins } from '../src/bot/relay-client.js';
+import { fetchChannelAdmins, subscribeGlobal, subscribeToChannel, watchConnectionState } from '../src/bot/relay-client.js';
+
+const noopLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: () => noopLogger } as any;
 
 const channelId = 'chan-1';
 const alice = 'alice'.padEnd(64, '1');
@@ -57,5 +59,103 @@ describe('fetchChannelAdmins', () => {
     const admins = await fetchChannelAdmins(relay, channelId, 20);
 
     expect(admins).toEqual(new Set());
+  });
+});
+
+describe('watchConnectionState', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function noopLoggerFactory() {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: () => logger } as any;
+    return logger;
+  }
+
+  it('logs a warning on drop and an info on recovery', () => {
+    vi.useFakeTimers();
+    const logger = noopLoggerFactory();
+    const relay = { url: 'ws://test', connected: true } as unknown as Relay;
+
+    const stop = watchConnectionState(relay, logger, 1000);
+
+    (relay as { connected: boolean }).connected = false;
+    vi.advanceTimersByTime(1000);
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ url: 'ws://test' }), expect.stringContaining('lost'));
+
+    (relay as { connected: boolean }).connected = true;
+    vi.advanceTimersByTime(1000);
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ url: 'ws://test' }), expect.stringContaining('restored'));
+
+    stop();
+  });
+
+  it('logs nothing while the connection stays stable', () => {
+    vi.useFakeTimers();
+    const logger = noopLoggerFactory();
+    const relay = { url: 'ws://test', connected: true } as unknown as Relay;
+
+    const stop = watchConnectionState(relay, logger, 1000);
+    vi.advanceTimersByTime(5000);
+
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.info).not.toHaveBeenCalled();
+
+    stop();
+  });
+
+  it('stops polling once stopped', () => {
+    vi.useFakeTimers();
+    const logger = noopLoggerFactory();
+    const relay = { url: 'ws://test', connected: true } as unknown as Relay;
+
+    const stop = watchConnectionState(relay, logger, 1000);
+    stop();
+    (relay as { connected: boolean }).connected = false;
+    vi.advanceTimersByTime(5000);
+
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+// Both subscribeToChannel and subscribeGlobal forward the relay's close
+// reason to an optional onClose callback — index.ts uses it to resubscribe
+// when the relay closes a subscription for a reason other than our own
+// shutdown (confirmed live: a reconnect can race NIP-42 re-auth and get
+// closed with "auth-required: not authenticated", and nostr-tools never
+// retries a closed subscription on its own).
+describe('subscribeToChannel onClose', () => {
+  it('forwards the relay-reported close reason to the onClose callback', () => {
+    let capturedHandlers: any;
+    const relay = {
+      subscribe: (_filters: any[], handlers: any) => {
+        capturedHandlers = handlers;
+        return { close: vi.fn() };
+      },
+    } as unknown as Relay;
+    const onClose = vi.fn();
+
+    subscribeToChannel(relay, channelId, [9], vi.fn(), noopLogger, onClose);
+    capturedHandlers.onclose('auth-required: not authenticated');
+
+    expect(onClose).toHaveBeenCalledWith('auth-required: not authenticated');
+  });
+});
+
+describe('subscribeGlobal onClose', () => {
+  it('forwards the relay-reported close reason to the onClose callback', () => {
+    let capturedHandlers: any;
+    const relay = {
+      subscribe: (_filters: any[], handlers: any) => {
+        capturedHandlers = handlers;
+        return { close: vi.fn() };
+      },
+    } as unknown as Relay;
+    const onClose = vi.fn();
+
+    subscribeGlobal(relay, [1631], vi.fn(), noopLogger, undefined, onClose);
+    capturedHandlers.onclose('auth-required: not authenticated');
+
+    expect(onClose).toHaveBeenCalledWith('auth-required: not authenticated');
   });
 });
