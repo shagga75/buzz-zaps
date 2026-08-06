@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseBountyCommand } from '../src/bot/command-parser.js';
+import { parseBountyCommand, parseRetryBountyCommand } from '../src/bot/command-parser.js';
 
 const id = 'a'.repeat(64);
 
@@ -23,5 +23,27 @@ describe('parseBountyCommand', () => {
 
   it('returns null for non-command messages', () => {
     expect(parseBountyCommand({ content: 'no bounty here' })).toBeNull();
+  });
+});
+
+describe('parseRetryBountyCommand', () => {
+  it('parses a well-formed /retry-bounty command', () => {
+    expect(parseRetryBountyCommand({ content: `/retry-bounty ${id}` })).toEqual({ targetEventId: id });
+  });
+
+  it('lowercases the event id', () => {
+    expect(parseRetryBountyCommand({ content: `/retry-bounty ${id.toUpperCase()}` })?.targetEventId).toBe(id);
+  });
+
+  it('rejects event ids that are not 64 hex chars', () => {
+    expect(parseRetryBountyCommand({ content: '/retry-bounty deadbeef' })).toBeNull();
+  });
+
+  it('rejects a command with a trailing amount (that is /bounty, not a retry)', () => {
+    expect(parseRetryBountyCommand({ content: `/retry-bounty ${id} 5000` })).toBeNull();
+  });
+
+  it('returns null for non-command messages', () => {
+    expect(parseRetryBountyCommand({ content: 'no retry here' })).toBeNull();
   });
 });

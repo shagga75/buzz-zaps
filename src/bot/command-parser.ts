@@ -61,3 +61,20 @@ export function parseBountyCommand(event: { content: string }): BountyCommand | 
   if (!Number.isFinite(amountSats) || amountSats <= 0) return null;
   return { targetEventId: targetEventId.toLowerCase(), amountSats };
 }
+
+// `/retry-bounty <pr-or-issue-event-id-hex>` — no amount: a retry pays out
+// whatever the still-open bounty already promised (bounties.getOpen), it
+// never lets a retry silently change the amount. Re-registering a new
+// amount is still what plain `/bounty` is for.
+const RETRY_BOUNTY_COMMAND_RE = /^\s*\/retry-bounty\s+([0-9a-f]{64})\s*$/i;
+
+export interface RetryBountyCommand {
+  targetEventId: string;
+}
+
+/** Parses a `/retry-bounty <event-id>` command. */
+export function parseRetryBountyCommand(event: { content: string }): RetryBountyCommand | null {
+  const match = RETRY_BOUNTY_COMMAND_RE.exec(event.content);
+  if (!match) return null;
+  return { targetEventId: match[1].toLowerCase() };
+}

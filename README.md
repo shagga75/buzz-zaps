@@ -11,6 +11,7 @@ pago → zap receipt (kind 9735) publicado de vuelta en el relay.
 Fase 2 (implementada): tres triggers automáticos.
 - Reacción: reaccionar con un emoji configurado (🐝 por defecto) a un mensaje zapea a su autor.
 - Bounty: `/bounty <pr-id> <monto>` promete un pago que se libera solo cuando ese PR se mergea (NIP-34).
+  `/retry-bounty <pr-id>` reintenta el payout de un bounty que quedó `open` (owner/admin de canal).
 - Cobro por tarea completada: un agente respondiendo (NIP-10) a un mensaje de un humano le cobra
   `amount_sats` a ese humano.
 
@@ -144,10 +145,14 @@ fork de Buzz). Dos cosas no obvias que se confirmaron leyendo el código antes d
   lo busca (`fetchEventById`) y descarta silenciosamente cualquier 1631 cuyo root no sea kind:1618.
 
 **Quién cobra**: el autor del PR (el `pubkey` que firmó el kind:1618 original, no quien lo mergeó — esos
-pueden ser personas distintas), resuelto vía el mismo `/link` que usa el trigger de reacción. Sin link
-previo, el bounty queda pago-pendiente indefinidamente (no hay reintento automático — el evento de merge
-solo se emite una vez). Guarda de auto-pago: si quien registró el bounty es la misma persona que
-figura como autor del PR, se rechaza el pago.
+pueden ser personas distintas), resuelto vía el mismo `/link` que usa el trigger de reacción. Guarda de
+auto-pago: si quien registró el bounty es la misma persona que figura como autor del PR, se rechaza el
+pago.
+
+Como el evento de merge solo se emite una vez, cualquier motivo por el que el payout automático no se
+complete (el autor todavía no corrió `/link`, la wallet estuvo caída, el pedido de invoice dio timeout)
+deja el bounty `open` para siempre — nada vuelve a dispararlo solo. Para eso está `/retry-bounty`, más
+abajo.
 
 **Idempotencia**: como el evento de merge no se repite, un `hasSourceEvent()` nuevo en `ZapStore` evita
 reprocesar el mismo merge si el relay lo reenvía (ej. tras una reconexión).
@@ -177,6 +182,27 @@ Live-testeado con un canal real: el pubkey que crea un canal (`kind:9007`) se vu
 Buzz, confirmado en la práctica — `/bounty` desde ese pubkey se registró; desde un pubkey random ajeno al
 canal quedó ignorado en silencio (verificado que ni siquiera pisó el registro existente vía el
 `ON CONFLICT` de `bounties.register()`).
+
+### Reintento manual de bounty payout
+
+```
+/retry-bounty <event-id-del-PR>
+```
+
+Re-intenta el payout de un bounty que sigue `open` — sin monto: paga lo que el bounty ya tenía prometido
+(`bounties.getOpen`), nunca lo que diga el comando. Mismo control de acceso que `/bounty` (owner/admin de
+canal vía `fetchChannelAdmins`), porque vuelve a pedir un pago real, no es de solo lectura.
+
+**Por qué re-chequea el merge en vez de confiar en el comando**: sin esa verificación, cualquier admin
+podría saltarse todo el modelo "paga solo cuando mergea" con solo tipear el comando antes de tiempo.
+`hasMergeStatusEvent` (`src/bot/relay-client.ts`) pregunta al relay `{"kinds":[1631],"#e":["<event-id>"]}`
+— si no hay ningún kind:1631 apuntando a ese PR (incluido un timeout de la consulta), el retry se rechaza
+con una respuesta en el canal en vez de pedir el invoice igual.
+
+La lógica de payout (buscar el PR, validar que sea kind:1618 y no un issue, resolver el autor vía `/link`,
+correr `runZapFlow`, marcar `paid` solo si el resultado es `'paid'`) es la misma función
+(`attemptBountyPayout`) que usa el payout automático al detectar el merge — este comando es la segunda
+forma de dispararla, no una reimplementación paralela.
 
 ## Fase 2 — cobro automático por tarea completada
 
@@ -471,6 +497,9 @@ eventos kind:9734/9735 — no reemplazan este flujo manual, que requiere las tre
    `detected merged bounty`.
 4. Si nadie registró un bounty para ese PR, o el autor no corrió `/link`, no pasa nada — silenciosamente,
    sin publicar nada en el canal.
+5. Si el payout automático no se completó (el autor corrió `/link` recién después, la wallet estaba caída,
+   el invoice dio timeout), un owner/admin del canal corre `/retry-bounty <event-id-del-PR>` para
+   reintentarlo — vuelve a chequear que el PR siga mergeado antes de pedir el invoice de nuevo.
 
 ### Fase 2: cobro por tarea completada
 
@@ -490,12 +519,12 @@ eventos kind:9734/9735 — no reemplazan este flujo manual, que requiere las tre
 ```
 src/
   bot/
-    relay-client.ts          # conectar (reconexión automática) + auth NIP-42 + suscribir(canal, resuscribe-on-close)/suscribir(global, ídem)/publicar/fetchEventById/fetchChannelAdmins/watchConnectionState
-    command-parser.ts        # detectar "/zap @user <monto>", "/link <username>", "/bounty <id> <monto>"
+    relay-client.ts          # conectar (reconexión automática) + auth NIP-42 + suscribir(canal, resuscribe-on-close)/suscribir(global, ídem)/publicar/fetchEventById/fetchChannelAdmins/hasMergeStatusEvent/watchConnectionState
+    command-parser.ts        # detectar "/zap @user <monto>", "/link <username>", "/bounty <id> <monto>", "/retry-bounty <id>"
     zap-flow.ts               # runZapFlow compartido — invoice → fee opcional → reply → poll → receipt (devuelve el outcome)
     link-flow.ts               # handler de /link
     reaction-flow.ts            # handler de reacciones (Fase 2), matchea contra triggers.yaml
-    bounty-flow.ts               # handler de /bounty + payout al detectar kind:1631 (NIP-34, Fase 2)
+    bounty-flow.ts               # handler de /bounty + /retry-bounty + payout compartido (attemptBountyPayout) al detectar kind:1631 (NIP-34, Fase 2)
     task-completion-flow.ts      # handler de reply-de-agente -> cobro al invocador (Fase 2)
     message-author-cache.ts     # cache eventId -> pubkey para resolver autores sin roundtrip
     agent-cache.ts               # cache pubkey -> es-agente (kind:10100), evita requery por mensaje
@@ -529,9 +558,9 @@ scripts/
   la extensión del listener propio que se implementó acá — quedó autocontenido a propósito para no
   depender de administrar workflows del lado de Buzz, pero delegarlo reusaría infraestructura que Buzz
   ya tiene battle-tested.
-- Reintento de bounties fallidos: si el pago timeoutea o falla, el bounty queda `open` pero no hay
-  ningún evento que lo vuelva a disparar (el merge solo ocurre una vez). Falta un comando manual de
-  reintento o un job periódico.
+- ~~Reintento de bounties fallidos~~ — resuelto: `/retry-bounty <event-id>` (ver "Fase 2 — bounty por PR
+  mergeado"). Sigue sin haber un job periódico automático — es un comando manual, a propósito (menor
+  alcance, no agrega un poller nuevo corriendo indefinidamente).
 - `pnpm admin-report` es de solo lectura y local (correr en la misma máquina/acceso al filesystem). Si
   algún día hace falta consultarlo remoto (ej. un dashboard real para un operador que no tiene shell en el
   server), ahí sí hace falta resolver el fork de auth/HTTP que se evitó a propósito acá.
