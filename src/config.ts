@@ -13,6 +13,13 @@ const envSchema = z.object({
   COMMUNITIES_CONFIG_PATH: z.string().default('./config/communities.example.yaml'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   ZAP_RECEIPT_EXTRA_RELAYS: z.string().default(''),
+  // Both optional at this level on purpose: most deployments never run
+  // scripts/admin-server.ts, so requiring these globally would break every
+  // other entrypoint (index.ts, admin-report.ts) for a feature they don't
+  // use. admin-server.ts itself refuses to start without a token — see
+  // there, not here, for the actual enforcement.
+  ADMIN_SERVER_PORT: z.coerce.number().int().positive().default(8090),
+  ADMIN_SERVER_TOKEN: z.string().min(1).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -26,6 +33,9 @@ export interface GlobalConfig {
   communitiesConfigPath: string;
   logLevel: Env['LOG_LEVEL'];
   zapReceiptExtraRelays: string[];
+  adminServerPort: number;
+  /** Undefined means admin-server.ts must refuse to start — see there. */
+  adminServerToken: string | undefined;
 }
 
 export function loadGlobalConfig(env: NodeJS.ProcessEnv = process.env): GlobalConfig {
@@ -40,6 +50,8 @@ export function loadGlobalConfig(env: NodeJS.ProcessEnv = process.env): GlobalCo
     zapReceiptExtraRelays: parsed.ZAP_RECEIPT_EXTRA_RELAYS.split(',')
       .map((relay) => relay.trim())
       .filter(Boolean),
+    adminServerPort: parsed.ADMIN_SERVER_PORT,
+    adminServerToken: parsed.ADMIN_SERVER_TOKEN,
   };
 }
 

@@ -13,7 +13,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "admin-report": "tsx --env-file=.env scripts/admin-report.ts"
+    "admin-report": "tsx --env-file=.env scripts/admin-report.ts",
+    "admin-server": "tsx --env-file=.env scripts/admin-server.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.9.1",
